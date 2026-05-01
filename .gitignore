@@ -1,0 +1,27 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.env
+
+# Spark / Delta runtime artifacts
+log-analytics-copilot/checkpoints/*
+!log-analytics-copilot/checkpoints/.gitkeep
+log-analytics-copilot/delta/*
+!log-analytics-copilot/delta/.gitkeep
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# Build artifacts
+*.log
+dist/
+build/
+node_modules/
