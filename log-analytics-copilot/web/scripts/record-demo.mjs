@@ -1,6 +1,6 @@
 /**
- * Records a cinematic demo to demo/sme-network-demo.webm
- * Holds on splash, Jira, discovery rail, mesh hops, and finale.
+ * Records a ~80s explain+show demo to demo/sme-network-demo.webm
+ * Captions animate over a 3× mesh run — no full-screen slides.
  */
 import { chromium } from "playwright";
 import fs from "node:fs";
@@ -21,25 +21,20 @@ const context = await browser.newContext({
   recordVideo: { dir: outDir, size: { width: 1440, height: 900 } },
 });
 const page = await context.newPage();
+const t0 = Date.now();
 
-console.log(`Recording cinematic demo from ${base} …`);
+console.log(`Recording ~80s demo from ${base} …`);
 await page.goto(base, { waitUntil: "networkidle", timeout: 60000 });
 await page.waitForSelector(".splash-title", { timeout: 30000 });
-await page.waitForTimeout(2400);
+await page.waitForTimeout(3500);
 
 await page.getByRole("button", { name: "Watch recorded demo" }).click();
 
-await page.waitForSelector(".jira-card", { timeout: 30000 });
-await page.waitForTimeout(2800);
+await page.waitForSelector(".beat-caption, .jira-card", { timeout: 30000 });
+await page.waitForTimeout(1800);
 
-// Mesh should be visible under discovery rail; wait for first hop signal too.
-await page.waitForSelector(".spot-rail", { timeout: 120000 });
-await page.waitForTimeout(2000);
-await page.waitForSelector(".signal", { timeout: 120000 }).catch(() => null);
-await page.waitForTimeout(3500);
-
-await page.waitForSelector(".finale-panel", { timeout: 240000 });
-await page.waitForTimeout(5000);
+await page.waitForSelector(".finale-panel", { timeout: 150000 });
+await page.waitForTimeout(9000);
 
 await context.close();
 await browser.close();
@@ -54,10 +49,10 @@ if (!recorded) {
   console.error("No webm produced");
   process.exit(1);
 }
-
 if (path.resolve(recorded) !== path.resolve(outFile)) {
   fs.renameSync(recorded, outFile);
 }
 
+const sec = ((Date.now() - t0) / 1000).toFixed(1);
 const mb = (fs.statSync(outFile).size / (1024 * 1024)).toFixed(2);
-console.log(`Saved ${outFile} (${mb} MB)`);
+console.log(`Saved ${outFile} (${mb} MB, ~${sec}s wall clock)`);

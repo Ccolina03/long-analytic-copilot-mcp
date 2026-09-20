@@ -26,8 +26,16 @@ import Splash from "@/components/Splash";
 import JiraTicket from "@/components/JiraTicket";
 import Spotlight from "@/components/Spotlight";
 import Finale from "@/components/Finale";
+import BeatCaption, {
+  beatForEvent,
+  demoEvents,
+  type Beat,
+} from "@/components/BeatCaption";
 
 type Tab = "event" | "doc";
+
+/** Caption stays up while the mesh keeps moving (~2.4s). */
+const BEAT_HOLD_MS = 2400;
 
 async function startDemo(): Promise<string> {
   const resp = await fetch("/api/demo", { method: "POST" });
@@ -46,41 +54,67 @@ async function waitForRun(id: string): Promise<TicketSnapshot> {
   throw new Error("timed out waiting for the agent run");
 }
 
-function delayFor(kind: string, cinematic: boolean): number {
-  // Cinematic = slower so transitions read on camera. Default = normal demo pace.
-  const scale = cinematic ? 1.35 : 1;
-  let base = 280;
-  if (kind === "request" || kind === "response") base = 5200;
-  else if (kind === "peer_decision") base = 2600;
-  else if (kind === "finding" || kind === "alternative" || kind === "concern") base = 1400;
-  else if (kind === "tool_call") base = 900;
-  else if (kind === "ticket") base = 3200;
-  else if (kind === "signal") base = 900;
-  return Math.max(160, Math.round(base * scale));
+/** ~3× faster than a normal watch — fits a ~80s explain+show cut. */
+function delayFor(kind: string, demo: boolean): number {
+  if (!demo) {
+    if (kind === "request" || kind === "response") return 4200;
+    if (kind === "peer_decision") return 2200;
+    if (kind === "finding" || kind === "alternative" || kind === "concern") return 1200;
+    if (kind === "tool_call") return 800;
+    if (kind === "ticket") return 2800;
+    return 220;
+  }
+  if (kind === "request" || kind === "response") return 2100;
+  if (kind === "peer_decision") return 950;
+  if (kind === "finding" || kind === "alternative") return 550;
+  if (kind === "tool_call") return 360;
+  if (kind === "ticket") return 2400;
+  if (kind === "artifact" || kind === "convergence") return 700;
+  return 150;
 }
 
 function replay(
   trace: Trace,
   onEvent: (e: TraceEvent) => void,
+  onBeat: (beat: Beat | null) => void,
   onDone: () => void,
-  cinematic: boolean,
+  demo: boolean,
 ) {
+  const events = demo ? demoEvents(trace.events) : trace.events;
   let i = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
+  let beatTimer: ReturnType<typeof setTimeout> | undefined;
+  const seen = new Set<string>();
+
+  const clear = () => {
+    if (timer) clearTimeout(timer);
+    if (beatTimer) clearTimeout(beatTimer);
+  };
+
   const tick = () => {
-    if (i >= trace.events.length) {
+    if (i >= events.length) {
+      onBeat(null);
       onDone();
       return;
     }
-    const e = trace.events[i];
+    const e = events[i];
     onEvent(e);
+
+    if (demo) {
+      const beat = beatForEvent(e, seen);
+      if (beat) {
+        onBeat(beat);
+        if (beatTimer) clearTimeout(beatTimer);
+        beatTimer = setTimeout(() => onBeat(null), BEAT_HOLD_MS);
+      }
+    }
+
     i += 1;
-    timer = setTimeout(tick, trace.events[i] ? delayFor(e.kind, cinematic) : 80);
+    timer = setTimeout(tick, events[i] ? delayFor(e.kind, demo) : 80);
   };
+
   tick();
-  return () => {
-    if (timer) clearTimeout(timer);
-  };
+  return clear;
 }
 
 function jiraKeyFrom(url: string, fallback: string): string {
@@ -100,7 +134,6 @@ export default function Page() {
     source_url: string;
   } | null>(null);
   const [status, setStatus] = useState<"idle" | "running" | "done" | "error">("idle");
-  const [source, setSource] = useState<"live" | "recorded">("live");
   const [selectedEvent, setSelectedEvent] = useState<number | null>(null);
   const [selectedAgent, setSelectedAgent] = useState<string | null>("mirrormaker");
   const [tab, setTab] = useState<Tab>("event");
@@ -110,6 +143,8 @@ export default function Page() {
   const [showJira, setShowJira] = useState(false);
   const [showFinale, setShowFinale] = useState(false);
   const [spotlightHold, setSpotlightHold] = useState(false);
+  const [beat, setBeat] = useState<Beat | null>(null);
+  const [demoMode, setDemoMode] = useState(false);
   const stopRef = useRef<(() => void) | null>(null);
   const jiraTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const spotTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -174,12 +209,12 @@ export default function Page() {
     if (e.kind === "ticket") {
       setShowJira(true);
       if (jiraTimer.current) clearTimeout(jiraTimer.current);
-      jiraTimer.current = setTimeout(() => setShowJira(false), 3400);
+      jiraTimer.current = setTimeout(() => setShowJira(false), 2000);
     }
     if (e.kind === "peer_decision") {
       setSpotlightHold(true);
       if (spotTimer.current) clearTimeout(spotTimer.current);
-      spotTimer.current = setTimeout(() => setSpotlightHold(false), 2100);
+      spotTimer.current = setTimeout(() => setSpotlightHold(false), 1600);
     }
   };
 
@@ -196,12 +231,14 @@ export default function Page() {
     setShowJira(false);
     setShowFinale(false);
     setSpotlightHold(false);
+    setBeat(null);
+    setDemoMode(false);
   };
 
   const runLive = async () => {
     reset();
     setStatus("running");
-    setSource("live");
+    setDemoMode(false);
     try {
       const id = await startDemo();
       const snap = await waitForRun(id);
@@ -230,6 +267,7 @@ export default function Page() {
       stopRef.current = replay(
         trace,
         pushEvent,
+        setBeat,
         () => {
           setDoc(snap.doc);
           setStatus("done");
@@ -243,10 +281,10 @@ export default function Page() {
     }
   };
 
-  const runRecorded = async (cinematic = true) => {
+  const runRecorded = async (demo = true) => {
     reset();
     setStatus("running");
-    setSource("recorded");
+    setDemoMode(demo);
     const trace = (await (await fetch("/demo-trace.json")).json()) as Trace & {
       doc?: string;
       ticket?: {
@@ -271,12 +309,13 @@ export default function Page() {
     stopRef.current = replay(
       trace,
       pushEvent,
+      setBeat,
       () => {
         setDoc(trace.doc ?? null);
         setStatus("done");
         setShowFinale(true);
       },
-      cinematic,
+      demo,
     );
   };
 
@@ -301,13 +340,10 @@ export default function Page() {
     ticketMeta?.title ||
     ticket?.detail ||
     "MirrorCheckpointConnector group discovery is slow";
-  const jiraKey = jiraKeyFrom(
-    ticketMeta?.source_url || "",
-    "KAFKA-18231",
-  );
+  const jiraKey = jiraKeyFrom(ticketMeta?.source_url || "", "KAFKA-18231");
 
   return (
-    <div className="shell">
+    <div className={`shell ${demoMode ? "demo" : ""}`}>
       <header className="top">
         <div>
           <div className="brand">
@@ -349,6 +385,8 @@ export default function Page() {
           selected={selectedAgent}
           onSelect={setSelectedAgent}
         />
+
+        <BeatCaption beat={beat} />
 
         <JiraTicket
           visible={showJira}
