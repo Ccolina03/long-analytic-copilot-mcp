@@ -1,36 +1,39 @@
 # SME Agent Network — Architecture
 
-> **One-line pitch:** Give us a bug ticket, and a network of specialized AI
-> engineers — each with persistent domain ownership, each armed with the
-> right tools — will figure out who needs to be involved, why, what the
-> dependencies are, and what needs to change. No human plays coordinator.
+> **One-line pitch:** Every team gets an AI SME that replaces the work of
+> the human specialist on that team — it owns that team's tickets, does
+> that team's investigation with that team's tools, and consults other
+> teams' SME agents directly when a fix crosses a boundary. No central
+> brain classifies tickets or plays coordinator.
 
 ## How to Read This Document
 
 This is written for an engineer who has never seen this project before.
-It is organized in eight parts, in the order you should actually read them:
+It is organized in eight parts, in the order you should actually read
+them:
 
-- **Part I** explains the problem and the core idea, at a high level, before
-  any implementation detail. Read this first even if you're impatient to
-  see code.
-- **Part II** explains how *one* agent works in isolation.
-- **Part III** explains how *multiple* agents work together — this is the
-  actual product.
-- **Part IV** shows the full system as one diagram, once you understand the
-  pieces.
-- **Part V** walks through one real example end to end, so the abstract
-  ideas above become concrete.
+- **Part I** explains the problem and the core idea, at a high level,
+  before any implementation detail.
+- **Part II** explains how *one* agent works in isolation — it is a full
+  replacement for one team's human SME, not a generic assistant.
+- **Part III** explains how agents consult each other directly, peer to
+  peer, when a ticket crosses a boundary — this is the actual product.
+- **Part IV** shows the full system as one diagram, once the pieces are
+  understood.
+- **Part V** walks through one real example end to end.
 - **Part VI** explains why this compounds into a defensible product over
-  time, rather than being a clever demo that plateaus.
+  time.
 - **Part VII** is the practical build plan.
-- **Part VIII** is a FAQ answering the "why not just do X instead" questions
-  a skeptical engineer will ask.
+- **Part VIII** is a FAQ answering the "why not just do X" questions.
+- **Part IX** is a phased implementation plan with concrete unit and
+  integration tests gating every step.
 
-One example is used consistently throughout the entire document: **three
-Kafka/Confluent teams — Kora Global (Cluster Linking), Consumer Team
-(GroupCoordinator), and OSS Kafka (protocol/KIPs) — coordinating on a
-real performance ticket.** Concrete runbooks for these three agents live in
-[`runbooks/`](./runbooks/) and are referenced throughout.
+One example is used consistently throughout: **the Kora Global team
+(Cluster Linking) has already identified that its offset-clamping code is
+too slow and has a rough idea of the fix. It owns the ticket and drives
+the work, consulting the Consumer Team (GroupCoordinator) and the OSS
+Kafka team (protocol/KIPs) directly along the way.** Concrete runbooks for
+these three agents live in [`runbooks/`](./runbooks/).
 
 ---
 
@@ -38,37 +41,42 @@ real performance ticket.** Concrete runbooks for these three agents live in
 
 ## 1. The Problem This Solves
 
-When a bug ticket is opened in a real engineering organization, a human
-has to do a lot of work *before* they can even start fixing anything:
+In a real engineering organization, most tickets do not start as a mystery
+that needs to be triaged from scratch. **A specific team notices a
+specific problem in a system it owns, and usually already has a rough
+idea of the fix.** For example: the Cluster Linking team notices that
+their failover path is slow, traces it to a specific function, and has a
+hypothesis — "we probably need an indexed lookup instead of a full scan."
+That team files the ticket, and that team is the one who has to drive it
+to resolution.
 
-- Figure out **which team owns** the affected code
-- Understand **unfamiliar codepaths** across service boundaries they don't
-  work in day to day
-- Find the **right subject-matter expert** for each domain the bug touches
-- Determine **what other systems** could be affected by a fix
-- Coordinate **approvals** from multiple team leads who each own a piece
-  of the change
-- Hold all of this in their head simultaneously while also trying to debug
+The hard part isn't figuring out *whose* problem this is — they already
+know. The hard part is everything downstream of that:
 
-This process routinely takes hours to days — and most of that time is
-**coordination overhead**, not actual engineering work. The engineer isn't
-slow at writing code; they're slow at discovering who to talk to and what
-those people know.
+- The proposed fix touches **code owned by another team**
+  (`GroupCoordinator` belongs to the Consumer Team, not Cluster Linking),
+  and someone has to actually validate whether the idea works there
+- That validation might surface a **further dependency** neither team
+  anticipated (a protocol change requiring upstream approval through the
+  Kafka KIP process)
+- Each of those teams has to actually **do real diligence** — check
+  memory cost, check compatibility, check precedent — not just say "sounds
+  fine"
+- Multiple team leads may need to **approve** before work can even start
+- The originating team has to **track all of this and assemble a plan**,
+  without anyone playing full-time project manager
 
-The underlying reason this is slow: every engineering organization has a
-real dependency graph. Team A's Cluster Linking feature depends on Team B's
-consumer group internals, which depend on Team C's protocol version
-support. **That graph is real, but it lives in people's heads and Slack
-history — not in any queryable system.** Nobody wrote it down because it
-emerged gradually, one incident and one PR at a time, and no single person
-holds the whole thing.
+This is coordination and cross-team validation work, and it routinely
+takes days even when the original diagnosis took an afternoon. The
+originating team already did the hard engineering thinking; what eats the
+calendar is chasing down the right person on two other teams, getting them
+to actually look at it, and stitching their answers together.
 
 ## 2. Why This Isn't Already Solved
 
 Multi-agent orchestration is already a crowded space. Before building
-anything, it's worth being precise about what already exists and where the
-actual gap is — otherwise this is "another AI wrapper" with no real
-differentiation.
+anything, it's worth being precise about what already exists and where
+the actual gap is.
 
 | Company | Core abstraction | What they actually provide |
 |---|---|---|
@@ -78,9 +86,10 @@ differentiation.
 | **Linzumi** | Human → many agents | Team chat interface that directs dozens of coding agents; turns org decisions into a source of truth |
 
 Every one of these answers **"how do agents run, talk, or remember."**
-None of them answer **"who should be involved in this specific change, why,
-and what's the actual technical impact — grounded in who really owns what
-code."** That's the gap.
+None of them answer **"who else needs to weigh in on this specific
+change, and what does their team's actual expertise say about it."**
+That's the gap, and it's specifically a gap about **domain ownership**,
+not about agent infrastructure.
 
 ```
 Superset:      many agents  →  parallel execution
@@ -88,77 +97,81 @@ Agent Relay:   many agents  →  shared plumbing (messaging/tools/history)
 Glen:          many agents  →  shared memory (retrieval)
 Linzumi:       human        →  many agents (command & control)
 
-THIS PROJECT:  ticket → SME agents → SME agents (typed consultation)
-                      → coordinated action → human approval only when needed
+THIS PROJECT:  a team's own problem → that team's SME agent owns it and
+                       drives it → consults other teams' SME agents
+                       directly, peer to peer, exactly when it needs to →
+                       assembles the plan itself → human approval only
+                       when a real decision requires one
 ```
 
-Two of these deserve a direct comment:
-
-- **Agent Relay** is an infrastructure layer this product could plausibly
-  run *on top of* someday (shared messaging, tool plumbing) — it is not a
-  reason not to build this, because it solves a different problem.
-- **Glen** is the closest adjacent risk, because organizational memory
-  sounds similar to a knowledge graph. The distinction: memory is
-  *retrieval* — "find me things that look related to this." This system is
-  *reasoning + ownership + action* — "here is exactly who owns this, why
-  they're affected, and what evidence proves it." Retrieval degrades
-  gracefully into noise as an org scales; a structured ownership graph gets
-  more precise as it accumulates more resolved tickets (see Part VI).
+**Glen** is the closest adjacent risk, because organizational memory
+sounds similar to what's described here. The distinction: memory is
+*retrieval* — "find me things that look related to this." What's described
+here is a **team's actual domain expert, replicated as software, doing
+that team's actual job** — running that team's tools, checking that team's
+invariants, and giving an answer with the same authority a senior engineer
+on that team would.
 
 ## 3. The Core Idea in One Picture
 
-Before any implementation detail, here is the entire idea in one flow:
-
 ```
- A ticket describing a real engineering problem arrives
+ A team notices a real, specific problem in a system it owns, and already
+ has a rough idea of the fix — this is the normal starting point, not a
+ mystery ticket that needs to be classified by something else first
                          │
                          ▼
- An Orchestrator figures out which teams' domains the ticket touches —
- not by keyword guessing, but by looking up a real graph of who owns
- what code and what depends on what
+ That team's SME Agent owns the ticket, exactly the way the human
+ specialist on that team would if it landed in their queue
                          │
                          ▼
- Each relevant team's SME Agent investigates using its OWN tools,
- grounded in its OWN domain's real production data — it does not
- guess about code it doesn't own
+ The owning agent investigates using ITS OWN tools, grounded in ITS OWN
+ team's real production data, and firms up the proposed direction
                          │
                          ▼
- When one agent's investigation touches another team's domain, it sends
- that team's agent a structured, typed question — not a free-text message —
- and gets back a structured, typed answer with a confidence score and an
- explicit list of anything it couldn't determine
+ When the fix touches a codepath or approval owned by another team, the
+ owning agent sends THAT team's SME Agent a structured, typed request
+ directly — peer to peer, the same way two human engineers would message
+ each other — there is no broker in between deciding who talks to whom
                          │
                          ▼
- The Orchestrator assembles all of this into one report: root cause,
- who needs to approve what, in what order, and what's still uncertain
+ The consulted agent does ITS OWN real diligence, exactly as the human
+ specialist on that team would — and if its own investigation surfaces a
+ further dependency, it consults a third team's agent the same way
                          │
                          ▼
- A human is looped in ONLY when the system itself says a decision
- genuinely requires human judgment — not for every step
+ The ORIGINATING agent — the one that owns the ticket — gathers what it
+ learned and assembles the final plan itself: root cause, approvals
+ needed, execution order, and what's still genuinely uncertain
+                         │
+                         ▼
+ A human is looped in only when the owning agent itself determines a
+ decision genuinely requires human judgment — not for every step
 ```
 
-Everything in Parts II–IV is the mechanics of making each of these five
-steps real and reliable, rather than "an LLM winging it."
+Everything in Parts II–IV is the mechanics of making each of these steps
+real: what it means for an agent to "own" a ticket, how it knows who else
+to talk to, and how that conversation stays precise instead of degrading
+into vague chat.
 
 ## 4. The Hypothesis We're Testing
 
 Before scaling any of this into a real platform, there's one question that
 has to be answered honestly:
 
-> **Does a network of specialized agents — each with persistent domain
-> ownership, communicating through a typed protocol with explicit
-> boundaries — actually produce better answers than one very capable coding
-> agent given the entire codebase and a huge context window?**
+> **Does a network of agents — each one a genuine replacement for a
+> specific team's SME, communicating peer to peer through a typed
+> protocol — actually produce better cross-team answers than one very
+> capable coding agent given the entire codebase and a huge context
+> window?**
 
-If the answer is yes, everything described in this document is justified.
-If the answer is no, this entire architecture is unnecessary complexity and
-a single strong agent is simply the better product.
+If yes, everything described in this document is justified. If no, this
+architecture is unnecessary complexity and a single strong agent is simply
+the better product.
 
 This is why the build plan (§13, Part VII) deliberately starts with an
 **investigation-only** phase — no autonomous code changes — and explicitly
 measures this system against a single-agent baseline before building
-anything further. The architecture is a hypothesis until that comparison
-is run.
+anything further.
 
 ---
 
@@ -166,10 +179,12 @@ is run.
 
 ## 5. The Three-Layer Agent Model
 
-A "SME Agent" in this system is not just an LLM with a clever system
-prompt. Every agent is built from three distinct layers of context, and
-keeping them separate is what makes the agent behave like a real domain
-expert instead of a chatbot that happens to know some Kafka trivia.
+A SME Agent in this system is not a generic assistant with a clever
+system prompt — it is meant to be a genuine, standing replacement for the
+human specialist on one specific team. It is built from three distinct
+layers of context, and keeping them separate is what makes it behave like
+a real domain expert rather than a chatbot that happens to know some
+Kafka trivia.
 
 ```
                     ┌─────────────────────┐
@@ -198,99 +213,130 @@ expert instead of a chatbot that happens to know some Kafka trivia.
 ```
 
 **Domain Memory** is what makes the agent an SME rather than a generic
-assistant, and it is the slowest-changing layer — it should look roughly
-the same today as it did last month, updated only as the team's real
-knowledge grows. For the Kora Global agent, this is everything in
+assistant, and it is the slowest-changing layer. For the Kora Global
+agent, this is everything in
 [`runbooks/kora-global-sme.md`](./runbooks/kora-global-sme.md): which
 repositories it owns, exactly which files and line ranges within them,
-known performance invariants, and the history of past incidents in Cluster
-Linking. This is deliberately **not** a single vector database with
-everything dumped in and retrieved by similarity search. "Who owns this
-file" and "what depends on this service" are graph questions — see §7 for
-why that distinction matters and how it's actually stored.
+known performance invariants, and the history of past incidents in
+Cluster Linking. This is deliberately **not** a single vector database
+with everything dumped in and retrieved by similarity search — see §7 for
+why ownership and dependency are graph questions, not similarity
+questions.
 
-**Live Context** is the opposite: it is specific to the one ticket being
-worked right now, and it disappears once the ticket is resolved (though
-the *outcome* of resolving it gets written back into Domain Memory and the
-Knowledge Graph — see Part VI). This includes the raw ticket text, any
-recent related incidents, in-flight changes to the same codepaths, and
-whatever trace or log evidence gets pulled while investigating.
+**Live Context** is specific to the one ticket being worked right now: the
+raw ticket text (including whatever diagnosis the filing team already
+did), any recent related incidents, in-flight changes to the same
+codepaths, and whatever additional trace or log evidence gets pulled
+while investigating further. It disappears once the ticket is resolved
+(though the *outcome* gets written back into the Knowledge Graph — see
+Part VI).
 
 **Capabilities** are the explicit, scoped set of things the agent is
-actually allowed to do: which MCP tools it can call, whether it can read or
-write GitHub PRs, whether it can post to Slack, whether it can trigger a
-CI run. Capabilities are scoped per agent on purpose — the Billing agent
-cannot open a pull request against the Broker team's repository, even if
-an LLM inside it decided that seemed like a good idea. This is an
-authorization boundary, not a suggestion in a prompt.
+actually allowed to do: which MCP tools it can call, whether it can read
+or write GitHub PRs, whether it can post to Slack, whether it can trigger
+a CI run. The Billing agent cannot open a pull request against the
+Broker team's repository, even if the underlying LLM decided that seemed
+useful — this is an authorization boundary enforced in code, not a
+suggestion in a prompt.
+
+### Every agent has two jobs, not one
+
+Because there is no central brain doing classification and delegation
+(see Part III), every agent needs to be able to do two distinct things:
+
+1. **Own a ticket** — when the problem originates in its own team's
+   domain, it drives the entire ticket from investigation through to a
+   final recommendation, consulting other agents as needed and producing
+   the final write-up itself.
+2. **Get consulted** — when *another* agent's ticket touches its domain,
+   it receives a structured request, does real diligence using its own
+   tools (not a shortcut answer), and responds — and if that diligence
+   surfaces a further dependency outside its own domain, it consults a
+   third agent the same way, on its own initiative.
+
+Both roles use the exact same agent, the exact same tools, and the exact
+same typed protocol (§8) — "owning" and "being consulted" are just two
+entry points into one agent, mirroring how a human engineer both drives
+their own team's tickets and gets pulled into other teams' investigations.
 
 ## 6. Ownership Boundaries
 
-Every agent has an explicit, non-overlapping ownership boundary. This is
-the detail that turns "five LLMs with slightly different system prompts"
-into something that actually mirrors a real engineering organization, and
-it's enforced by code, not just by asking the model nicely.
+Every agent has an explicit, non-overlapping ownership boundary — the
+detail that makes this a network of specialists rather than five copies
+of the same generalist with different system prompts. It's enforced in
+code, not just requested in a prompt.
 
-Here are the three agents that exist today, with their real ownership
-boundaries (the full detail, including exact file paths and line numbers,
-is in each agent's runbook):
+Here are the three agents that exist today (full detail, including exact
+file paths and line numbers, is in each agent's runbook):
 
 ```
-kora-global          (Cluster Linking — the "proposer" in our example)
+kora-global          (Cluster Linking — owns the example ticket below)
   owns:
     confluent/kora-cluster-linking/src/main/java/io/confluent/clusterlink/
-    → see runbooks/kora-global-sme.md for exact files and line ranges
+    → see runbooks/kora-global-sme.md
 
-consumer-team        (GroupCoordinator — the "code owner" in our example)
+consumer-team        (GroupCoordinator — consulted for feasibility)
   owns:
     apache/kafka: core/src/main/scala/kafka/coordinator/group/
     confluent/kora-group-coordinator/
-    → see runbooks/consumer-team-sme.md for exact files and line ranges
+    → see runbooks/consumer-team-sme.md
 
-oss-kafka            (Protocol + KIP process — the "upstream gate")
+oss-kafka            (Protocol + KIP process — consulted for the upstream path)
   owns:
     apache/kafka: clients/src/main/resources/common/message/*.json
     the Apache Kafka KIP process itself
-    → see runbooks/oss-kafka-sme.md for exact files and precedent KIPs
+    → see runbooks/oss-kafka-sme.md
 ```
 
-**The rule that makes this matter:** when an agent's investigation touches
-a codepath it does not own, it is not allowed to guess about it — even if
-the underlying LLM is perfectly capable of guessing correctly most of the
-time. Instead, it must send a structured request to the agent that *does*
-own that codepath (this is the typed protocol in §8). The Orchestrator
-enforces this by checking, after the fact, that any codepath an agent cites
-in its findings actually falls within that agent's declared ownership. If
-it doesn't, the finding gets flagged as unverified rather than trusted as
-fact.
-
-This is deliberately the opposite failure mode of a single giant-context
-agent, which will confidently reason about code it has never actually
-touched in production, simply because it fits in the context window.
+**The rule that makes this matter:** when an agent's own investigation
+touches a codepath it does not own, it is not allowed to guess about it,
+even if the underlying LLM could probably guess correctly most of the
+time. It has to actually message the agent that owns that codepath (§8).
+Every agent self-checks this before finalizing any finding: it validates
+that every codepath it is about to cite falls within its own declared
+ownership, and marks anything else as something it obtained from another
+agent's response rather than its own knowledge. This is the opposite
+failure mode of a single giant-context agent, which will confidently
+reason about code it has never actually worked in, simply because it fits
+in the context window.
 
 ---
 
 # Part III — How Agents Work Together
 
-Part II described one agent in isolation. The actual product only exists
-once multiple agents can reliably (a) know who else to talk to, and
-(b) exchange information without the message degrading into vague prose
-after a couple of hops. That's what this part covers.
+Part II described one agent in isolation, and its two jobs (owning a
+ticket vs. being consulted). This part explains what actually happens
+when a ticket needs more than one team — which is the actual product.
+
+**There is no central Orchestrator that classifies tickets, decides who
+gets called, or assembles the final answer.** The agent that owns the
+ticket does all of that itself, the same way a human engineer driving a
+cross-team fix would: they read the ticket (theirs, because it's their
+team's problem), they figure out who else they probably need based on
+what they already know about the system plus a quick lookup of who owns
+what, they message those people directly, and they write the final
+summary themselves once they have what they need.
+
+The only central piece that exists is a **thin intake router** — described
+in §9 — whose entire job is receiving an incoming ticket and handing it to
+the team it's actually assigned to. It does not reason about the ticket's
+content at all.
 
 ## 7. The Engineering Knowledge Graph
 
-When the Orchestrator receives a ticket, its first job is to figure out
-which agents even need to be involved. It does this by querying a real,
-structured graph of the organization's engineering reality — not by
-guessing from keywords in the ticket text, and not by semantic similarity
-search over a pile of documents.
+When the owning agent realizes its fix touches code it doesn't own, it
+needs to know who to talk to — the same way a human engineer would check
+an internal wiki, a CODEOWNERS file, or just ask around. Rather than
+re-deriving this from scratch or guessing, every agent has access to a
+shared, structured graph of the organization's real ownership and
+dependency structure.
 
-The reason this needs to be a graph and not a vector database: the
-questions that actually matter are graph-traversal questions, not
-similarity questions. "Who owns this file," "what does merging this PR
-block," and "which team must approve this class of change" cannot be
-answered by finding text that looks similar — they can only be answered by
-walking real edges between real entities.
+This needs to be a graph, not a vector database, because the actual
+questions — "who owns this file," "what does merging this block," "which
+team must approve this class of change" — are graph-traversal questions.
+Semantic similarity search cannot answer "what is the dependency chain
+between offset clamping and a Kafka protocol version bump"; it can only
+find text that looks related.
 
 ```
 Service
@@ -320,11 +366,9 @@ Team
 
 ### How this is actually stored
 
-The MVP storage choice is deliberately boring: **Postgres**, with the graph
-represented as two tables — nodes (`entities`) and edges. A dedicated graph
-database is not needed until query complexity genuinely outgrows SQL
-joins, which is unlikely to happen before there's real product-market fit
-to justify the added operational complexity.
+Deliberately boring: **Postgres**, with the graph represented as two
+tables — nodes (`entities`) and typed edges. A dedicated graph database is
+not needed until query complexity genuinely outgrows SQL joins.
 
 ```sql
 CREATE TABLE entities (
@@ -351,46 +395,45 @@ CREATE INDEX idx_edges_to   ON edges(to_id, relation);
 
 ### Where the edges actually come from
 
-Nobody manually types this graph in — it has to be mined from signals that
-already exist in a real engineering organization:
-
 | Source | Produces |
 |---|---|
 | CODEOWNERS files + git history | `Team --owns--> Repository`, `Team --owns--> CodePath` |
 | PR descriptions and review comments | `Decision --applies_to--> CodePath`, `Decision --introduced_by--> PR` |
-| Log traces (`trace_id` shared across services) | `Service --depends_on--> Service`, weighted by how often it happens |
+| Log traces (`trace_id` shared across services) | `Service --depends_on--> Service`, weighted by frequency |
 | Static call-graph analysis | `CodePath --calls--> CodePath` |
-| Outcomes of tickets this system itself resolves | `ChangeType --must_approve--> Team`, learned from who actually signed off |
+| Outcomes of tickets this system resolves | `ChangeType --must_approve--> Team`, learned from who actually signed off |
 
-That last row is important and is expanded on in Part VI: every ticket this
-system resolves makes the graph slightly more accurate for the *next*
-ticket. That compounding effect is the actual long-term moat, not any
-single clever agent.
+Any agent can query this graph directly — `owning_team("GroupCoordinator")`
+— the same lightweight lookup a human would do before sending a Slack
+message. That last row matters for Part VI: every ticket resolved through
+this system makes the graph slightly more accurate for the next agent that
+queries it.
 
 ## 8. Agent-to-Agent Protocol
 
-Once the Orchestrator knows which agents are relevant, those agents need
-to actually exchange information with each other. The obvious approach —
-just let them message each other in free text, the way a human Slack
-conversation would look — has a specific, serious failure mode: **free-text
-LLM-to-LLM communication compounds interpretation error with every hop.**
-By the third agent in a chain, claims have quietly drifted from "here is
-evidence" into "here is my paraphrase of someone else's paraphrase." Nobody
-downstream can tell where confidence should have dropped.
+Once the owning agent knows who else it needs, it messages that agent
+directly — peer to peer, not through a broker. The obvious approach —
+letting agents exchange free text the way a Slack thread would look — has
+a specific, serious failure mode: **free-text LLM-to-LLM communication
+compounds interpretation error with every hop.** By the third agent in a
+chain, claims have quietly drifted from "here is evidence" into "here is
+my paraphrase of someone else's paraphrase," with no visible signal of
+where confidence should have dropped.
 
 So agents exchange a **typed, structured message** instead. Here is the
-actual example from our running scenario: `kora-global` (Cluster Linking)
-has found that its offset-clamping code is too slow, and needs to ask
-`consumer-team` (who owns GroupCoordinator) whether a fix is even possible.
+actual example from the running scenario: `kora-global` already diagnosed
+that its offset-clamping code is slow because of full group scans, and
+has a rough fix idea. It now needs to ask `consumer-team` — who actually
+owns `GroupCoordinator` — whether that idea is even feasible.
 
-**Request, from `kora-global` to `consumer-team`:**
+**Request, from `kora-global` directly to `consumer-team`:**
 
 ```json
 {
   "from": "kora-global",
   "to": "consumer-team",
   "request_type": "impact_analysis",
-  "change_description": "Need an indexed lookup: given a topic-partition, return only the consumer groups subscribed to it, instead of scanning every group in the cluster.",
+  "change_description": "We've traced our offset-clamping slowness to a full ListGroups() scan on every failover. We want an indexed lookup: given a topic-partition, return only the subscribed groups, instead of scanning the whole cluster.",
   "questions": [
     "Can GroupCoordinator support an indexed reverse lookup by topic-partition?",
     "What would the memory cost be at Confluent Cloud scale?",
@@ -400,7 +443,7 @@ has found that its offset-clamping code is too slow, and needs to ask
 }
 ```
 
-**Response, from `consumer-team` back to `kora-global`:**
+**Response, from `consumer-team` directly back to `kora-global`:**
 
 ```json
 {
@@ -414,20 +457,22 @@ has found that its offset-clamping code is too slow, and needs to ask
 }
 ```
 
-Why this specific shape matters: the agent (or the Orchestrator) reasoning
-about the answer sees **actual falsifiable claims** — a named list of
-affected components, an explicit confidence number, and a field that says
-exactly what this agent could *not* determine — instead of a paragraph of
-prose it has to re-interpret. This is auditable (you can point at exactly
-which claim came from where), diffable (you can compare two responses
-mechanically), and it can be checked against the Knowledge Graph from §7
-before anyone downstream trusts it.
+The response is not a courtesy reply — `consumer-team` actually ran its
+own tools (`get_offset_storage_schema`, `estimate_index_memory_cost`) to
+produce it, exactly as the human Consumer Team engineer would have if
+Slacked with the same question. Notice the last field: `consumer-team`
+itself does not know whether this needs a new protocol version, so it
+says so explicitly and — on its own initiative, without being told to —
+goes and asks `oss-kafka` next. **No third party decided that consumer-team
+should talk to oss-kafka; consumer-team figured that out itself, the same
+way a human engineer would realize mid-investigation that they need to
+loop in one more person.**
 
-`open_questions` deserves particular attention: an agent admitting "I don't
-know this part" is treated as a **first-class, successful output**, not a
-failure to hide. This is precisely the signal the Orchestrator uses to
-decide when a ticket needs to escalate to a human (§9) instead of being
-silently resolved with a confident-sounding guess.
+`open_questions` is what makes this honest: an agent admitting "I don't
+know this part" is a first-class, successful output, not a failure to
+hide. It's also the signal that eventually tells the *ticket-owning* agent
+(§9) when something needs to escalate to a human instead of being quietly
+resolved with a confident-sounding guess.
 
 ### The formal schema
 
@@ -452,54 +497,65 @@ message ImpactResponse {
 }
 ```
 
-## 9. The Ticket as Orchestration Layer
+## 9. The Ticket as a Unit of Ownership
 
-Putting §7 and §8 together: the ticket itself is not something an agent
-merely *answers* with a paragraph. It is the **unit of work** that drives
-the entire pipeline from first read to final recommendation, accumulating
-structured artifacts — findings, typed impact responses, evidence,
-confidence scores — at every stage, instead of a wall of chat transcript
-that a human has to re-read to understand what actually happened.
+Putting §7 and §8 together: a ticket belongs to exactly one team's agent
+from start to finish. That agent is responsible for the entire arc —
+investigation, reaching out to whichever other agents it decides it needs,
+and writing the final recommendation — the same way a human engineer who
+files a ticket for their own team stays the owner of it even while other
+people get pulled in to help.
 
 ```
                     Jira / GitHub Ticket
+                  (assigned to a specific team,
+                   because that team found the problem)
                             │
                             ▼
-                    ┌───────────────┐
-                    │  Orchestrator │
-                    └───────┬───────┘
-                            │
-              query the Knowledge Graph (§7) to find
-              which agents own the affected entities
-                            │
-          ┌─────────────────┼─────────────────┐
-          ▼                 ▼                 ▼
-    kora-global agent  consumer-team agent  oss-kafka agent
-          │                 │                 │
-          │◄── ImpactRequest / ImpactResponse ─┤
-          │     (typed protocol, §8, both ways) │
-          └─────────────────┼─────────────────┘
+                  ┌───────────────────┐
+                  │  Ticket Router     │   ← the ONLY central component,
+                  │  (intake only —    │     and it does no reasoning —
+                  │   no reasoning)    │     it just reads "team: kora-
+                  └─────────┬─────────┘     global" off the ticket and
+                            │                hands it to that agent
                             ▼
-                     Impact Analysis
-                     (assembled from every
-                      agent's structured findings)
+                  kora-global agent
+                  (owns this ticket end to end)
+                            │
+              investigates with its OWN tools,
+              confirms its OWN diagnosis and fix idea
+                            │
+              looks up ownership in the Knowledge Graph (§7),
+              decides on its own who else it needs
                             │
                             ▼
-                       Root Cause
+              sends a typed ImpactRequest directly to
+              consumer-team (§8)
+                            │
+              consumer-team does its OWN real diligence,
+              realizes it needs oss-kafka, and consults
+              oss-kafka directly — on its own initiative
+                            │
+              responses flow back to kora-global
                             │
                             ▼
-                  Recommended Fix + Execution Order
+              kora-global — because it OWNS the ticket —
+              assembles the final plan itself: root cause,
+              approvals needed, execution order, and what's
+              still genuinely uncertain
                             │
                             ▼
                     Human approval gate
-              (only triggered if the system itself
-               says requires_human = true)
+              (only if kora-global itself determines a
+               decision genuinely requires one)
 ```
 
-The reason this design produces an auditable final answer rather than a
-black box: at the end, you can point to exactly which agent said what,
-with what confidence, and what evidence backed it up — because every step
-along the way was a typed message, not a summarized conversation.
+The reason this produces an auditable final answer rather than a black
+box: at the end, you can point to exactly which agent said what, with what
+confidence, and what evidence backed it up — because every cross-team
+exchange was a typed message (§8), and the final write-up was produced by
+the one agent that was actually accountable for the ticket throughout,
+not synthesized after the fact by something that wasn't really involved.
 
 ---
 
@@ -507,61 +563,56 @@ along the way was a typed message, not a summarized conversation.
 
 ## 10. System Architecture, Layer by Layer
 
-With Parts II and III explained, here is the complete system as one
-diagram. Every box below corresponds to something already explained above.
+With Parts II and III explained, here is the complete system. Notice there
+is no "Orchestrator" box doing classification or consultation — that logic
+now lives inside every agent, because every agent needs to be able to own
+a ticket.
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │  INPUTS                                                              │
 │  GitHub Issues · Jira Webhooks · Slack Alerts · Manual HTTP POST    │
+│  Each ticket already carries (or is assigned) an owning team         │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │ HTTPS
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  API GATEWAY  (FastAPI)                                              │
+│  API GATEWAY + TICKET ROUTER  (FastAPI)                              │
 │  • Single external entry point, handles auth + rate limiting         │
 │  • Normalizes any ticket format (Jira/GitHub/raw) into one shape     │
-│  • Translates the incoming HTTP request into an internal gRPC call,  │
-│    then streams findings back to the caller as they arrive          │
+│  • Reads which team the ticket is assigned to and hands it directly  │
+│    to that team's agent — no domain classification, no reasoning     │
+│  • Streams that agent's progress back to the caller as it works      │
 └──────────────────────────────┬──────────────────────────────────────┘
-                               │ gRPC: TriageTicket(Ticket)
+                               │ gRPC: OwnTicket(Ticket) — sent straight
+                               │ to the one agent that owns it
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│  ORCHESTRATOR                                                        │
-│  • Keeps a live registry of every SME agent that has registered      │
-│  • Classifies which agents are relevant by querying the Knowledge    │
-│    Graph (§7) — not by keyword-matching the ticket text              │
-│  • Calls each relevant agent's Investigate() method in parallel      │
-│  • Routes typed ImpactRequest / ImpactResponse messages between      │
-│    agents as their investigations surface cross-team questions (§8)  │
-│  • Validates that every codepath an agent cites falls inside that    │
-│    agent's declared ownership boundary (§6) — flags it if not        │
-│  • Assembles the final result and escalates to a human only if the   │
-│    agents themselves signal that a decision requires one             │
-└──────┬────────────┬────────────┬────────────┬────────────┬──────────┘
-       │ gRPC       │ gRPC       │ gRPC       │ gRPC       │ gRPC
-       ▼            ▼            ▼            ▼            ▼
-┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐ ┌──────────┐
-│   SME    │ │   SME    │ │   SME    │ │  SME     │ │  SME     │
-│  Agent:  │ │  Agent:  │ │  Agent:  │ │ Agent:   │ │ Agent:   │
-│  Kora    │ │ Consumer │ │   OSS    │ │ Broker   │ │ Billing  │
-│  Global  │ │  Team    │ │  Kafka   │ │ (future) │ │ (future) │
-│          │ │          │ │          │ │          │ │          │
-│ built    │ │ built    │ │ built    │ │          │ │          │
-│ from the │ │ from the │ │ from the │ │          │ │          │
-│ 3-layer  │ │ 3-layer  │ │ 3-layer  │ │          │ │          │
-│ model §5 │ │ model §5 │ │ model §5 │ │          │ │          │
-└────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘
-     │            │            │             │            │
-     └────────────┴────────────┴─────────────┴────────────┘
-                               │ MCP tool calls
-                               ▼
+│           THE OWNING SME AGENT (e.g. kora-global)                    │
+│  • Investigates with its own tools and its own Domain Memory (§5)    │
+│  • Looks up ownership in the Knowledge Graph (§7) to decide who       │
+│    else it needs — on its own, the way a human engineer would        │
+│  • Sends typed ImpactRequests directly to other agents (§8)          │
+│  • Assembles the final plan itself once it has what it needs         │
+└──────┬─────────────────────────────────────────────────┬─────────────┘
+       │ gRPC: ImpactRequest / ImpactResponse             │ gRPC (same protocol,
+       ▼ (peer to peer — no broker in the middle)         │  may fan out further)
+┌──────────┐                                        ┌──────────┐
+│   SME    │  ── may itself consult a third agent → │   SME    │
+│  Agent:  │     the same way, on its own            │  Agent:  │
+│ Consumer │     initiative (e.g. consumer-team      │   OSS    │
+│  Team    │◄──────────────────────────────────────► │  Kafka   │
+└────┬─────┘                                        └────┬─────┘
+     │                                                    │
+     └─────────────────────┬──────────────────────────────┘
+                            │ every agent's Capabilities layer
+                            │ calls MCP tools the same way
+                            ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  MCP TOOL SERVER  (FastAPI)                                          │
-│  Shared observability tools any agent's Capabilities layer can call: │
+│  Shared observability tools any agent can call:                      │
 │  query_logs · top_errors · search_keyword · blast_radius             │
-│  Plus domain-specific tools declared per agent — see each agent's    │
-│  runbook in runbooks/ for its full tool list                         │
+│  Plus domain-specific tools declared per agent — see runbooks/        │
 └──────────────────────────────┬──────────────────────────────────────┘
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -575,13 +626,14 @@ diagram. Every box below corresponds to something already explained above.
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-One clarification that matters for anyone who saw an earlier version of
-this project: the Kafka/Spark/Delta log pipeline that this repository
-started with is **one input source that feeds the Knowledge Graph** — it
-is not the center of the architecture. The center of the architecture is
-the Knowledge Graph and the typed agent protocol above it; the log pipeline
-is plumbing that supplies one kind of evidence (`depends_on` edges mined
-from shared `trace_id`s across services) among several.
+One clarification for anyone who saw an earlier version of this document:
+there used to be a central "Orchestrator" that classified tickets and ran
+a consultation loop across agents. That responsibility has moved **into
+each agent** — every agent can own a ticket and drive its own
+consultations, the same way a human specialist would. The only thing that
+remains centralized is dumb intake routing (which team does this ticket
+belong to), and the shared Knowledge Graph and MCP tool server that every
+agent reads from.
 
 ---
 
@@ -589,23 +641,20 @@ from shared `trace_id`s across services) among several.
 
 ## 11. End-to-End Walkthrough: Consumer Groups Per Topic
 
-Everything above is abstract until you watch one real ticket move through
-it. This section is both the technical mechanism explained step by step
-*and* the actual demo script — nothing here is simplified for
-presentation purposes; every tool call and message shown is a real tool
-declared in that agent's runbook.
+**The starting point is not a mystery bug.** The Kora Global team already
+noticed, in its own production data, that failover is too slow, and it
+already has a hypothesis about the fix. That's the normal case, and it's
+where this walkthrough starts.
 
-**The ticket, in plain language:** Confluent's Cluster Linking feature has
-to "clamp" consumer offsets during a failover — meaning, for every consumer
-group that was reading a topic on the old cluster, figure out the right
-place for it to resume reading on the new cluster. Today, doing this
-requires listing *every* consumer group in the entire cluster and checking
-each one to see if it happens to be subscribed to the topic being failed
-over. On a large cluster with 50,000 groups, this takes 8–12 seconds and
-puts heavy load on the exact component (`GroupCoordinator`) that's already
-under stress during a failover. What's actually needed is a lookup that
-goes directly from "this topic-partition" to "these specific groups,"
-without scanning everything else.
+**What Kora Global already knows before filing the ticket:** during a
+failover, `ClusterLinking.clampOffsets()` has to find every consumer group
+subscribed to the topics being failed over. Today it does this by listing
+*every* group in the entire cluster and checking each one — on a cluster
+with 50,000 groups, that takes 8–12 seconds and hammers the exact
+component (`GroupCoordinator`) that's already under stress during a
+failover. Kora Global's rough idea: a lookup that goes directly from
+"this topic-partition" to "these specific groups," without scanning
+everything else.
 
 ```
 clampOffsets(topic, partition):                 # what happens today
@@ -614,54 +663,61 @@ clampOffsets(topic, partition):                 # what happens today
     if topic in DescribeGroup(group):            # extra RPC per group
       clamp(group, topic, partition)
 
-clampOffsets(topic, partition):                 # what's actually needed
+clampOffsets(topic, partition):                 # Kora Global's proposed fix
   groups = ListGroupsForTopicPartition(topic, partition)  # O(1) — <50ms
   for group in groups:
     clamp(group, topic, partition)
 ```
 
-Here is the system working through it, minute by minute:
+Here is `kora-global` owning this ticket from start to finish:
 
 ```
-13:42:01  Ticket received:
-          "Cluster Linking offset clamping during failover is too slow.
-           Currently calls ListGroups() on the entire cluster and filters."
+13:42:01  Ticket filed BY Kora Global, assigned to Kora Global:
+          "Our clampOffsets() is too slow because of a full ListGroups()
+           scan on every failover. We think we need an indexed lookup by
+           topic-partition. Need to confirm this is feasible and figure
+           out what it takes to ship."
 
-13:42:08  Orchestrator queries the Knowledge Graph (§7):
-          "ListGroups" codepath   → owned_by → consumer-team
-          "clampOffsets" codepath → owned_by → kora-global
-          → decides to involve: kora-global, consumer-team, oss-kafka
+13:42:03  Ticket Router reads "team: kora-global" off the ticket and
+          hands it straight to the kora-global agent — no classification,
+          no other agent is even aware of this yet
 
-13:42:12  kora-global agent investigates first — it's the team in pain,
-          and it owns the evidence:
+13:42:12  kora-global agent starts working ITS OWN ticket, using ITS OWN
+          tools to firm up the diagnosis it already suspected:
           tool get_failover_latency()   → p99 = 11,400ms, 91% of that
                                            time spent inside listGroups
-          tool get_offset_clamp_trace() → confirms 50,312 groups were
-                                           scanned to find just 4 matches
-          → produces a finding with confidence 0.95, and flags that it
-            needs input from both consumer-team and oss-kafka
+          tool get_offset_clamp_trace() → confirms 50,312 groups scanned
+                                           to find just 4 real matches
+          → its own hypothesis is now backed by hard evidence, but it
+            knows it doesn't own GroupCoordinator, so it can't just
+            assume the fix is buildable — it has to ask
 
-13:42:21  kora-global sends consumer-team a typed ImpactRequest (§8):
-          "Need an indexed lookup by topic-partition. Can GroupCoordinator
-           support this? What would it cost in memory?"
+13:42:21  kora-global looks up ownership in the Knowledge Graph (§7):
+          "GroupCoordinator" → owned_by → consumer-team
+          → sends consumer-team a typed ImpactRequest directly:
+          "We've traced this to a full ListGroups() scan. Can
+           GroupCoordinator support an indexed lookup by topic-partition?
+           What would it cost in memory?"
 
-13:42:27  consumer-team agent responds — it owns GroupCoordinator, so it
-          can answer with real detail instead of guessing:
-          tool get_offset_storage_schema()     → confirms no reverse
-                                                   index exists today
-          tool estimate_index_memory_cost()    → ~14MB overhead for a
-                                                   50,000-group cluster
+13:42:27  consumer-team receives the request and does ITS OWN real
+          diligence — not a courtesy answer, actual investigation:
+          tool get_offset_storage_schema()  → confirms no reverse index
+                                                exists today
+          tool estimate_index_memory_cost() → ~14MB overhead for a
+                                                50,000-group cluster
           ImpactResponse:
             affected_components: [GroupCoordinator, GroupMetadata]
             invariants: ["group state must stay consistent across rebalance"]
             confidence: 0.9
             open_questions: ["needs a new Kafka API version — ask oss-kafka"]
 
-13:42:31  consumer-team forwards the remaining open question to oss-kafka:
-          "Does adding a topic-partition filter to ListGroups need a KIP?"
+13:42:31  consumer-team, on its OWN initiative — nobody told it to —
+          recognizes it needs a second opinion and consults oss-kafka
+          directly: "Does adding a topic-partition filter to ListGroups
+          need a KIP?"
 
-13:42:44  oss-kafka agent responds — it owns the protocol and the KIP
-          process, so it checks against real precedent instead of guessing:
+13:42:44  oss-kafka does its OWN real diligence — it owns the protocol
+          and the KIP process, so it checks against real precedent:
           tool search_kips("ListGroups topic partition filter")
                → finds KIP-518 as the closest precedent, confirms it does
                  NOT cover this case — a new KIP is genuinely required
@@ -669,12 +725,11 @@ Here is the system working through it, minute by minute:
                → passes, with one note: interaction with the newer
                  KIP-848 consumer protocol needs explicit review
           ImpactResponse: impact_level = HIGH, confidence = 0.92
+          → responds back to consumer-team, who relays the combined
+            answer back to kora-global
 
-13:43:12  Orchestrator checks every codepath cited above against each
-          agent's declared ownership boundary (§6) — all citations check
-          out, nothing gets flagged as unverified
-
-13:43:20  Orchestrator assembles the final result:
+13:43:20  kora-global — because it OWNS this ticket — assembles the final
+          plan itself, from what it learned across both consultations:
           execution_order:
             1. kora-global confirms this should go upstream, not stay
                Confluent-internal
@@ -688,18 +743,19 @@ Here is the system working through it, minute by minute:
                                implementation can begin — this is a real
                                decision, not something to resolve silently"
 
-13:43:22  The ticket is updated with: the root cause, the affected
-          components, every piece of evidence collected, the approval
-          order, and the one open question (KIP-848 compatibility) that
-          the system explicitly could not resolve on its own.
+13:43:22  kora-global updates its OWN ticket with: the root cause
+          (now backed by hard evidence, not just a hunch), the affected
+          components across two other teams, the full approval chain,
+          and the one open question (KIP-848 compatibility) nobody could
+          fully resolve.
 ```
 
 Every line above corresponds to a real tool declared in that agent's
-runbook and a real typed message from §8 — nothing here is a scripted
-narration written just for a pitch. In an actual demo, you should be able
-to click into any line and see the exact JSON `ImpactRequest`/
-`ImpactResponse` and the raw tool output behind it. **That auditability is
-the actual product**, not a side effect of it.
+runbook and a real typed message from §8 — nothing here is scripted for a
+pitch. In an actual demo, you should be able to click into any line and
+see the exact `ImpactRequest`/`ImpactResponse` JSON and the raw tool
+output behind it. **That auditability is the actual product**, not a side
+effect of it.
 
 The full domain runbooks referenced above — with exact repository paths,
 line ranges, and complete tool specifications — are:
@@ -718,56 +774,57 @@ Anyone can wrap an LLM in a nice UI this week. The actual defensibility
 question is: what does this system have in six months that a competitor
 starting from scratch does not?
 
-Look back at the walkthrough in Part V. Notice the exact chain the
-Orchestrator needed to reason through, before calling a single agent:
+Look back at the walkthrough in Part V. Notice the chain that
+`kora-global` had to discover by actually consulting people, because
+nothing told it up front:
 
 ```
 Failover
    ↓
-Offset clamping   (owned by kora-global)
+Offset clamping   (owned by kora-global — where the ticket started)
    ↓
-ListGroups scan   (owned by consumer-team)
+ListGroups scan   (owned by consumer-team — first agent consulted)
    ↓
 GroupCoordinator index design
    ↓
 Kafka protocol version bump
    ↓
-KIP approval   (owned by oss-kafka)
+KIP approval   (owned by oss-kafka — consulted by consumer-team, not
+                 by kora-global directly — a chain kora-global didn't
+                 even know to expect)
 ```
 
-The first time this ticket type is seen, discovering that chain requires
-every agent to actually investigate and consult each other, the way Part V
-walked through. **But that chain — "changes to offset clamping eventually
-need protocol-level approval through consumer-team and oss-kafka" — gets
-written back into the Knowledge Graph as real `depends_on` and
-`must_approve` edges once this ticket resolves.**
+The first time this ticket type comes through, discovering that chain
+requires the full sequence of consultations from Part V. **But that
+chain — "changes to offset clamping eventually need protocol-level
+approval through consumer-team and oss-kafka" — gets written back into the
+Knowledge Graph as real `depends_on` and `must_approve` edges once this
+ticket resolves.**
 
-So the *next* time a ticket mentions failover or offset clamping, the
-Orchestrator already knows, before calling a single agent, that this is
-likely to cross three domains and end in a KIP approval — because it saw
-that exact pattern resolve once before. A generic coding agent with a large
-context window has to re-derive this reasoning from scratch, from the raw
-codebase, on every single ticket, because it has no persistent place to
-store "I figured this out already."
+So the next time any team's agent owns a ticket that touches failover or
+offset clamping, it can look this chain up directly instead of discovering
+it step by step through live consultation. A generic coding agent with a
+large context window has no persistent place to store "this exact chain
+was already worked out" — it re-derives it from the raw codebase every
+single time.
 
-Concretely, every ticket this system resolves writes back:
+Concretely, every ticket resolved through this system writes back:
 
-- New `depends_on` edges discovered during impact analysis that weren't
-  in the graph before
-- New `must_approve` edges learned from who actually signed off on the
-  resulting change
+- New `depends_on` edges discovered during consultation that weren't in
+  the graph before
+- New `must_approve` edges learned from who actually signed off
 - Updated `confidence` scores on existing edges — confirmed if the outcome
   matched, downgraded if it didn't
 - New `Decision` nodes linking the resulting PR back to the reasoning that
   produced it
 
-This means the system's answer to "who needs to be involved" gets
-**structurally more accurate with every ticket it resolves** — not just
-"there's more text available for retrieval," which is what a memory-only
-competitor (like Glen, from §2) provides. A team that has run this system
-for a year has a graph that a competitor starting today cannot buy,
-scrape, or reconstruct from public data, because most of those edges only
-exist as tribal knowledge until this system extracts and records them.
+This means the system's answer to "who else do I need" gets **structurally
+more accurate with every ticket it resolves** — not just "more text
+available for retrieval," which is what a memory-only competitor (like
+Glen, from §2) provides. A team that has run this system for a year has a
+graph a competitor starting today cannot buy, scrape, or reconstruct from
+public data, because most of these edges only exist as tribal knowledge
+until agents actually consult each other and record what they learned.
 
 ---
 
@@ -776,21 +833,21 @@ exist as tribal knowledge until this system extracts and records them.
 ## 13. Phased Rollout
 
 Given the open hypothesis in §4, the rollout is deliberately staged so
-that autonomous code changes are *never* the first thing built. Each phase
-only starts once the previous one has actually demonstrated its claim.
+that autonomous code changes are never the first thing built.
 
 ### Phase 1 — Investigation & Impact Analysis (the MVP)
 
 ```
-Ticket → investigation → cross-team impact analysis → root cause →
-a written-up recommended fix (NOT automatically applied)
+A team's agent owns a real ticket → investigates with its own tools →
+consults other agents directly as needed → writes up a recommended fix
+(NOT automatically applied)
 ```
 
-Success is measured by comparing this system's triage — accuracy, speed,
-and specifically how many real cross-team impacts it catches — against
-both a human on-call engineer and a single large-context-window coding
-agent given the same ticket and full repository access. This comparison
-*is* the test of the hypothesis in §4.
+Success is measured by comparing this system's output — accuracy, speed,
+and specifically how many real cross-team dependencies it catches —
+against both the human specialist who would have owned this ticket, and a
+single large-context-window coding agent given the same ticket and full
+repository access.
 
 ### Phase 2 — Draft Changes
 
@@ -798,10 +855,8 @@ agent given the same ticket and full repository access. This comparison
 Phase 1 output → branch + tests + a draft PR (a human merges it)
 ```
 
-This phase only starts after Phase 1 shows that cross-agent impact analysis
-genuinely catches things a single agent misses — that's the actual
-differentiator being tested, and it needs to be proven before investing in
-code generation.
+Starts only after Phase 1 shows that peer-to-peer agent consultation
+genuinely catches things a single agent misses.
 
 ### Phase 3 — Autonomous Remediation
 
@@ -810,8 +865,8 @@ Phase 2 output → auto-merge for low-risk, high-confidence changes →
 human review reserved for the escalated subset
 ```
 
-This phase is gated behind sustained accuracy in Phase 2, in production,
-over real tickets — not behind a demo looking good.
+Gated behind sustained accuracy in Phase 2, in production, over real
+tickets.
 
 ## 14. Repository Layout
 
@@ -821,27 +876,26 @@ log-analytics-copilot/
 ├── proto/
 │   ├── logs.proto               # LogEvent + LogIngestionService (existing)
 │   └── sme_agents.proto         # Ticket, Finding, ImpactRequest/Response,
-│                                 # Orchestrator + SMEAgent RPCs (§8)
+│                                 # SMEAgent RPCs (§8) — no Orchestrator RPCs
 │
 ├── knowledge-graph/
 │   ├── schema.sql                # entities + edges tables (§7)
 │   ├── ingest_github.py          # PRs, CODEOWNERS → ownership edges
 │   ├── ingest_traces.py          # trace_id co-occurrence → depends_on edges
-│   └── ingest_ticket_outcomes.py # resolved tickets → must_approve edges
+│   ├── ingest_ticket_outcomes.py # resolved tickets → must_approve edges
+│   └── query.py                  # owning_team() / depends_on() — called
+│                                  # directly by every agent, not a service
 │
-├── gateway/
-│   ├── main.py                   # FastAPI — external entry point
-│   └── Dockerfile
-│
-├── orchestrator/
-│   ├── main.py                   # gRPC server + agent registry
-│   ├── classifier.py             # Knowledge-graph-driven domain classifier
-│   ├── consultation.py           # Investigate → ImpactRequest/Response loop
-│   ├── ownership_validator.py    # checks cited codepaths against §6 boundaries
+├── router/
+│   ├── main.py                   # thin FastAPI intake — reads the
+│   │                              # assigned team off a ticket and hands
+│   │                              # it to that agent, no reasoning at all
 │   └── Dockerfile
 │
 ├── agents/
-│   ├── base_agent.py             # SMEAgentBase + @tool decorator + 3-layer context (§5)
+│   ├── base_agent.py             # SMEAgentBase: the 3-layer context (§5),
+│   │                              # OwnTicket() workflow AND ConsultAbout()
+│   │                              # workflow, ownership self-validation (§6)
 │   ├── kora_global_agent.py
 │   ├── consumer_team_agent.py
 │   ├── oss_kafka_agent.py
@@ -874,6 +928,13 @@ log-analytics-copilot/
 └── ARCHITECTURE.md               ← this file
 ```
 
+Note the absence of an `orchestrator/` directory. What used to be
+"Orchestrator logic" — the knowledge-graph lookup and the consultation
+loop — is now a shared library (`knowledge-graph/query.py` and the
+consultation logic inside `agents/base_agent.py`) that every agent calls
+for itself. The only standalone service is `router/`, and it is
+deliberately dumb.
+
 ## 15. Data Schema
 
 ### LogEvent (`proto/logs.proto`)
@@ -884,7 +945,7 @@ log-analytics-copilot/
 | `service` | string | Partition key in the Silver log table |
 | `level` | string | DEBUG / INFO / WARN / ERROR |
 | `message` | string | Free-form, tokenized for keyword search |
-| `trace_id` | string | Shared across services for one logical request — this is what feeds `depends_on` edges into the Knowledge Graph |
+| `trace_id` | string | Shared across services for one logical request — feeds `depends_on` edges into the Knowledge Graph |
 | `event_id` | string | Unique per log line, used for deduplication |
 | `host` | string | Originating host |
 
@@ -903,23 +964,26 @@ log-analytics-copilot/
 | `silver_logs` | Silver | Parsed and deduplicated on `(trace_id, event_id)`, partitioned by service |
 | `service_graph` | Gold | `(from_service, to_service, co_occurrences)` — feeds `depends_on` edges into the Knowledge Graph |
 
-### `Finding` / `ImpactResponse` (`proto/sme_agents.proto`)
+### `Ticket` / `Finding` / `ImpactResponse` (`proto/sme_agents.proto`)
 
-Every SME agent returns these same shapes (§8). Fields are additive —
-an agent only fills in what it actually knows, and `open_questions` is a
-first-class field for admitted uncertainty rather than a forced guess.
+Every agent's `OwnTicket()` result and every `ConsultAbout()` response uses
+these same shapes (§8). Fields are additive — an agent only fills in what
+it actually knows, and `open_questions` is a first-class field for
+admitted uncertainty rather than a forced guess.
 
 ## 16. Adding a New SME Agent
 
 Adding a new domain to the network is meant to be a small, mechanical
-change — not a redesign of the proto or the Orchestrator.
+change.
 
 **Step 1 — Write the runbook.** Create `runbooks/my-team-sme.md`
 describing what the team owns (exact repo paths and, where useful, line
 ranges), and what domain-specific tools it needs. Use the three existing
-runbooks as the template for the level of detail expected.
+runbooks as the template.
 
-**Step 2 — Implement the agent:**
+**Step 2 — Implement the agent.** It inherits both the "own a ticket"
+workflow and the "get consulted" workflow from the shared base class —
+nothing custom needs to be written for either:
 
 ```python
 from agents.base_agent import SMEAgentBase, tool
@@ -931,16 +995,17 @@ class MyTeamAgent(SMEAgentBase):
 
     @tool("my_tool")
     async def my_tool(self, param: str) -> dict:
-        """One-line description shown to the Orchestrator's classifier."""
+        """One-line description used when reasoning about which tool to call."""
         return await self.mcp.query_logs(f"SELECT ... WHERE service='my-service'")
 ```
 
-**Step 3 — Register it.** Add the new agent to `docker-compose.yml`. On
-boot, it registers itself with the Orchestrator automatically.
+**Step 3 — Register it.** Add the new agent to `docker-compose.yml` and to
+the Ticket Router's team → agent address mapping, so tickets assigned to
+this team actually reach it.
 
-Nothing about the proto, the Orchestrator, or any existing agent needs to
-change. The Knowledge Graph picks up the new `Team --owns--> Repository`
-edges directly from the new agent's declared `OWNS` list and runbook.
+Nothing about the proto or any existing agent needs to change. The
+Knowledge Graph picks up the new `Team --owns--> Repository` edges
+directly from the new agent's declared `OWNS` list.
 
 ## 17. Build Roadmap
 
@@ -954,23 +1019,27 @@ edges directly from the new agent's declared `OWNS` list and runbook.
 ### Phase 1 — Knowledge Graph + typed protocol (Weeks 1–2)
 - [ ] `knowledge-graph/schema.sql` — entities + edges (§7)
 - [ ] `knowledge-graph/ingest_github.py` — CODEOWNERS + PR history → ownership edges
+- [ ] `knowledge-graph/query.py` — the lookup library every agent calls directly
 - [ ] `proto/sme_agents.proto` — `Ticket`, `Finding`, `ImpactRequest`/`ImpactResponse` (§8)
-- [ ] `orchestrator/ownership_validator.py` — enforce §6 boundaries in code
 
-### Phase 2 — First three SME agents (Weeks 3–4)
+### Phase 2 — Base agent framework + first three agents (Weeks 3–4)
+- [ ] `agents/base_agent.py` — `OwnTicket()` and `ConsultAbout()` workflows,
+      ownership self-validation (§6)
 - [ ] `agents/consumer_team_agent.py`, `kora_global_agent.py`, `oss_kafka_agent.py`
-- [ ] Orchestrator consultation loop using the typed protocol
-- [ ] Knowledge-graph-driven classifier, replacing keyword-only routing
+- [ ] `router/main.py` — thin intake, team → agent address mapping
 
 ### Phase 3 — Prove the core hypothesis (Week 5)
-- [ ] Run the same 10–20 real tickets through (a) this multi-agent system
-      and (b) a single large-context-window agent with full repo access
-- [ ] Compare root-cause accuracy, cross-team impacts caught, and time to answer
+- [ ] Run the same 10–20 real tickets through (a) this system, letting the
+      real owning team's agent drive each one, and (b) a single
+      large-context-window agent with full repo access
+- [ ] Compare root-cause accuracy, cross-team dependencies caught, and
+      time to answer
 - [ ] **Decision point:** proceed to Phase 2 of the rollout (§13) only if
-      the multi-agent system demonstrably wins on impact-catch rate
+      this system demonstrably wins on cross-team catch rate
 
 ### Phase 4 — Draft PRs (Phase 2 of the rollout, §13)
-- [ ] Fix Planner + Code Agent + Test Agent
+- [ ] Fix Planner + Code Agent + Test Agent, invoked by the owning agent
+      once its plan is assembled
 - [ ] The consumer-groups-per-topic example from Part V produces an actual
       draft pull request, end to end
 
@@ -980,45 +1049,66 @@ edges directly from the new agent's declared `OWNS` list and runbook.
 
 ## 18. Design Decisions
 
+**Why no central Orchestrator that classifies tickets and coordinates
+agents?**
+Because that's not how the real problem works. A ticket is not a mystery
+that needs to be classified into domains by something outside the
+originating team — a specific team already knows it's their problem, and
+they're the ones with the context to know (roughly) who else might be
+affected, the same way a human engineer would. Putting a classifier in
+front of that adds a layer that can misroute or add latency without adding
+real judgment. The agent that owns the problem is the right one to decide
+who else to loop in, using the Knowledge Graph as a lookup tool, not a
+decision-maker.
+
+**If there's no Orchestrator, what does the Ticket Router actually do?**
+Only one thing: reads which team a ticket is assigned to and hands it to
+that team's agent. It does not reason about ticket content, does not
+decide which other agents get involved, and does not assemble the final
+result. That's deliberately dumb, on purpose — all the judgment lives in
+the agent that owns the ticket.
+
+**Why does the "get consulted" agent sometimes consult a third agent on
+its own?**
+Because that's what happens when a human specialist gets pulled into an
+investigation and realizes mid-way that they need someone else's input
+too — they don't report back "I don't know" and wait for someone else to
+decide who to ask next; they go ask. Consumer Team consulting OSS Kafka in
+Part V, without Kora Global ever asking for that specifically, is the
+system working as intended, not an edge case.
+
 **Why a typed agent-to-agent protocol instead of free-form chat?**
 Free-form LLM-to-LLM chat compounds interpretation error with every hop —
 by the third agent in a chain, claims have quietly drifted from evidence
 into paraphrase, with no visible signal of where confidence should have
 dropped. A typed `ImpactRequest`/`ImpactResponse` (§8) forces every agent
-to commit to structured, falsifiable claims — a list of affected
-components, an explicit confidence score, an explicit list of open
-questions — that the Orchestrator can check against the Knowledge Graph
-before anything downstream is allowed to trust them.
+to commit to structured, falsifiable claims that the next agent, or the
+owning agent assembling the final plan, can check rather than reinterpret.
 
 **Why a Postgres knowledge graph instead of a vector database?**
 "Who owns this," "what does this block," and "which team must approve this
 kind of change" are graph-traversal questions, not similarity-search
 questions. A vector database answers "what text looks similar to this
-text" — it fundamentally cannot answer "what is the actual dependency chain
-between offset clamping and a Kafka protocol version bump." Postgres with
-a plain entities/edges schema is boring, cheap to run, and directly answers
-the questions this product actually needs answered. A dedicated graph
-database is only worth the added operational complexity if query patterns
-genuinely outgrow SQL joins later.
+text" — it cannot answer "what is the actual dependency chain between
+offset clamping and a Kafka protocol version bump." Postgres with a plain
+entities/edges schema is boring, cheap to run, and directly answers the
+questions this product actually needs answered.
 
 **Why enforce explicit ownership boundaries instead of letting every
 agent know everything?**
 Without a boundary, every agent is tempted to guess about code it doesn't
 actually own — which is exactly the failure mode of a single big-context
 agent: confident, fluent, and sometimes wrong about code it has never
-really worked in. Requiring an agent to send a typed request to the agent
-that actually owns a codepath, rather than answering from a guess, is what
-makes the network's *aggregate* answer more reliable than any single
-agent's guess. That only holds if the boundary is enforced by the
-Orchestrator in code (§6), not left as a polite suggestion in a prompt.
+really worked in. Requiring an agent to message the agent that actually
+owns a codepath, rather than answering from a guess, is what makes the
+network's aggregate answer more reliable than any single agent's guess.
 
 **Why gRPC between agents, but MCP for tool calls?**
 Agent-to-agent messages need typed contracts and can be several hops deep
 in a single ticket's consultation chain — gRPC is built for exactly that.
-Tool calls are simple request-response calls against the MCP server, which
-is already HTTP-native and discoverable through its manifest endpoint.
-These are genuinely different kinds of communication and conflating them
-into one protocol would make both worse.
+Tool calls are simple request-response calls against the MCP server,
+which is already HTTP-native and discoverable through its manifest
+endpoint. These are genuinely different kinds of communication.
 
 **Why is the log pipeline treated as one peripheral input, not the
 center of the system?**
@@ -1032,22 +1122,22 @@ one kind of evidence into it.
 
 **Why not start with autonomous code changes?**
 Because the hypothesis in §4 — that specialized agents with ownership
-boundaries and typed communication beat one strong generalist agent — has
-not actually been proven yet. Building auto-merge PR generation before
-answering that question risks building an elaborate architecture that a
-much simpler system would have matched just as well. Phase 1 of the
-rollout (§13) exists specifically to settle that question honestly before
-any further investment.
+boundaries and peer-to-peer typed communication beat one strong
+generalist agent — has not actually been proven yet. Building auto-merge
+PR generation before answering that question risks building an elaborate
+architecture that a much simpler system would have matched just as well.
+Phase 1 of the rollout (§13) exists specifically to settle that question
+honestly before any further investment.
 
 ---
 
 # Part IX — Implementation & Validation Plan
 
-Part VII gave the high-level roadmap (Phase 0 through Phase 4). This part
-turns that roadmap into buildable slices small enough to implement in a
-day or two each, with an explicit test suite gating every slice. **Nothing
-in this plan is considered "done" until its tests are green** — the tests
-are the actual definition of done, not a nice-to-have added afterward.
+Part VII gave the high-level roadmap. This part turns that roadmap into
+buildable slices small enough to implement in a day or two each, with an
+explicit test suite gating every slice. **Nothing in this plan is
+considered "done" until its tests are green** — the tests are the actual
+definition of done, not a nice-to-have added afterward.
 
 ## 19. How to Use This Plan
 
@@ -1061,12 +1151,10 @@ smaller slices. Every slice has the same five parts:
 - **Manual validation** — a command you can run by hand to sanity-check
   the slice before trusting the automated tests
 - **Definition of done** — the specific, checkable condition that means
-  this slice is genuinely finished, not just "code exists"
+  this slice is genuinely finished
 
 Work through the phases in order — each one depends on the previous one
-existing and passing its tests. Do not start Phase 2 with Phase 1's tests
-red; that debt compounds badly in a multi-agent system where later phases
-depend on earlier ones being trustworthy, not just present.
+existing and passing its tests.
 
 ## 20. Phase 1 — Knowledge Graph Foundation
 
@@ -1075,22 +1163,15 @@ depend on earlier ones being trustworthy, not just present.
 **Build:** `knowledge-graph/schema.sql`, `knowledge-graph/db.py` (connection
 pool + a small migration runner that applies `schema.sql` idempotently)
 
-**Unit tests** (`knowledge-graph/tests/test_schema.py`, no live DB needed —
-test the SQL string / migration logic itself):
-- `test_schema_sql_is_valid_syntax` — parse the file with a SQL parser
-  (e.g. `sqlparse`) and assert no syntax errors
-- `test_migration_is_idempotent_on_repeat_apply` — running the migration
-  runner twice against a mocked cursor issues `CREATE TABLE IF NOT EXISTS`
+**Unit tests** (`knowledge-graph/tests/test_schema.py`, no live DB needed):
+- `test_schema_sql_is_valid_syntax`
+- `test_migration_is_idempotent_on_repeat_apply`
 
-**Integration tests** (`knowledge-graph/tests/test_schema_integration.py`,
-against a real throwaway Postgres — spin one up with
-`docker run -d postgres:16` in a test fixture):
+**Integration tests** (against a real throwaway Postgres):
 - `test_entities_and_edges_tables_exist_after_migration`
-- `test_edge_from_id_and_to_id_enforce_foreign_key` — inserting an edge
-  with a nonexistent `from_id` raises an integrity error
+- `test_edge_from_id_and_to_id_enforce_foreign_key`
 - `test_edge_confidence_defaults_to_one_point_zero`
-- `test_indexes_exist_on_edges_from_and_to` — query
-  `pg_indexes` and assert `idx_edges_from` / `idx_edges_to` are present
+- `test_indexes_exist_on_edges_from_and_to`
 
 **Manual validation:**
 ```bash
@@ -1101,8 +1182,7 @@ psql postgresql://postgres:test@localhost:5433/postgres -c '\dt'
 ```
 
 **Definition of done:** `pytest knowledge-graph/tests/test_schema*.py -v`
-is fully green, and the manual `\dt` shows both tables with the indexes
-from §7 present.
+is fully green.
 
 ### 20.2 Slice: GitHub Ingestion
 
@@ -1113,77 +1193,53 @@ and recent PR metadata, writes `Team --owns--> Repository/CodePath` edges
 - `test_parses_codeowners_line_into_pattern_and_owner`
 - `test_ignores_comment_lines_and_blank_lines`
 - `test_maps_wildcard_pattern_to_codepath_entity_with_correct_metadata`
-- `test_pr_description_with_no_owner_mention_produces_no_decision_edge`
 
-**Integration tests** (against a small fixture repo checked into
-`knowledge-graph/tests/fixtures/sample-repo/`, containing a real
-`CODEOWNERS` file and a couple of commits):
+**Integration tests** (against a fixture repo in
+`knowledge-graph/tests/fixtures/sample-repo/`):
 - `test_ingest_produces_owns_edge_for_each_codeowners_entry`
-- `test_ingest_is_re_runnable_without_duplicating_edges` — run twice,
-  assert edge count is unchanged, `last_seen_at` is updated instead
+- `test_ingest_is_re_runnable_without_duplicating_edges`
 
 **Manual validation:**
 ```bash
 python -m knowledge_graph.ingest_github --repo runbooks/ --dry-run
-# expect printed edges like:
-# Team(consumer-team) --owns--> CodePath(core/src/.../GroupCoordinator.scala)
 ```
 
 **Definition of done:** running the ingestor against the three existing
 runbooks' declared `OWNS` paths produces the exact ownership edges shown
-in §6, verified by an integration test that asserts on the specific edge
-rows, not just "some edges exist."
+in §6.
 
 ### 20.3 Slice: Trace-Based Dependency Mining
 
-**Build:** `knowledge-graph/ingest_traces.py` — reads the `service_graph`
-Delta/Gold table produced by the log pipeline (§10) and writes
-`Service --depends_on--> Service` edges weighted by co-occurrence count
+**Build:** `knowledge-graph/ingest_traces.py`
 
 **Unit tests:**
 - `test_co_occurrence_row_produces_depends_on_edge_with_matching_weight`
-- `test_self_referential_rows_are_excluded` (`from_service == to_service`)
-- `test_zero_co_occurrence_rows_are_skipped`
+- `test_self_referential_rows_are_excluded`
 
-**Integration tests** (reuse `scripts/produce-fake-logs.py` to generate a
-known, small set of synthetic logs with controlled `trace_id` overlap
-across services):
-- `test_end_to_end_from_synthetic_logs_produces_expected_edge_count` —
-  produce logs where `service-a` and `service-b` share exactly 5 `trace_id`s
-  and no others, run the full pipeline, assert exactly one `depends_on`
-  edge with weight 5
+**Integration tests** (reuse `scripts/produce-fake-logs.py`):
+- `test_end_to_end_from_synthetic_logs_produces_expected_edge_count`
 
-**Manual validation:**
-```bash
-python -m knowledge_graph.ingest_traces --source delta/service_graph
-psql ... -c "SELECT * FROM edges WHERE relation = 'depends_on' LIMIT 10;"
-```
+**Definition of done:** the integration test is green, and running the
+ingestor against the real Delta data already on disk produces at least
+one `depends_on` edge verifiable by eye in the raw logs.
 
-**Definition of done:** the integration test above is green, and running
-the ingestor against the real Delta data already on disk in this repo
-(from the earlier May 2026 pipeline run) produces at least one
-`depends_on` edge that matches something a human can verify by eye in the
-raw logs.
+### 20.4 Slice: Graph Query Library
 
-### 20.4 Slice: Graph Query API
+**Build:** `knowledge-graph/query.py` — `owning_team(codepath)`,
+`depends_on(service, depth=1)`, `must_approve(change_type)`. This is a
+**library**, imported directly by every agent — not a network service —
+because every agent needs to run this lookup for itself.
 
-**Build:** `knowledge-graph/query.py` — the functions the Orchestrator
-actually calls: `owning_team(codepath)`, `depends_on(service, depth=1)`,
-`must_approve(change_type)`
-
-**Unit tests** (against a small in-memory or SQLite-backed fixture graph,
-not Postgres — these should be fast):
+**Unit tests:**
 - `test_owning_team_returns_correct_team_for_exact_path_match`
 - `test_owning_team_returns_none_for_unknown_path`
 - `test_depends_on_respects_requested_depth`
-- `test_depends_on_returns_edges_sorted_by_confidence_descending`
 
-**Integration tests** (seed a real Postgres test DB with the ownership
-edges from §20.2 using the three real runbooks):
-- `test_owning_team_of_list_groups_returns_consumer_team` — this is the
-  literal example from §10: `owning_team("ListGroups")` must return
-  `"consumer-team"`
-- `test_owning_team_of_clamp_offsets_returns_kora_global` — likewise,
+**Integration tests** (seed a real Postgres test DB from the three real
+runbooks):
+- `test_owning_team_of_list_groups_returns_consumer_team` —
+  `owning_team("ListGroups")` must return `"consumer-team"`
+- `test_owning_team_of_clamp_offsets_returns_kora_global` —
   `owning_team("clampOffsets")` must return `"kora-global"`
 
 **Manual validation:**
@@ -1195,30 +1251,26 @@ print(owning_team('clampOffsets'))  # expect: kora-global
 "
 ```
 
-**Definition of done for Phase 1:** all tests across 20.1–20.4 pass in CI,
-and the two manual query calls above return the correct agent names
-against a graph built entirely from real ingestion — this is the exact
-lookup the Orchestrator performs at `13:42:08` in the Part V walkthrough,
-now backed by real code instead of a narrated example.
+**Definition of done for Phase 1:** all tests across 20.1–20.4 pass, and
+the two manual query calls above return the correct agent names — this is
+the exact lookup `kora-global` performs at `13:42:21` in the Part V
+walkthrough, now backed by real code.
 
 ## 21. Phase 2 — Typed Protocol
 
 ### 21.1 Slice: Proto Definitions
 
 **Build:** `proto/sme_agents.proto` (the schema from §8), plus generated
-Python stubs via `protoc`
+Python stubs
 
-**Unit tests** (`proto/tests/test_messages.py`):
+**Unit tests:**
 - `test_impact_request_round_trips_through_serialize_and_parse`
 - `test_impact_response_open_questions_defaults_to_empty_list`
 - `test_finding_confidence_field_accepts_float_between_0_and_1`
 
 **Integration tests:**
-- `test_protoc_generates_python_stubs_without_error` — actually invoke
-  `protoc` in the test (or as a pre-test build step) and import the result
-- `test_grpc_channel_can_send_impact_request_to_stub_server` — spin up a
-  minimal test gRPC server that echoes the request back, confirm the
-  message survives the wire round trip unchanged
+- `test_protoc_generates_python_stubs_without_error`
+- `test_grpc_channel_can_send_impact_request_to_stub_server`
 
 **Manual validation:**
 ```bash
@@ -1230,341 +1282,263 @@ print(m)
 "
 ```
 
-**Definition of done:** `protoc` compiles cleanly, and the manual command
-above prints a well-formed message with the fields set as expected.
+**Definition of done:** `protoc` compiles cleanly and the manual command
+prints a well-formed message.
 
-### 21.2 Slice: Ownership Validator
+### 21.2 Slice: Ownership Self-Validation
 
-**Build:** `orchestrator/ownership_validator.py` — checks that every
-`codepaths` entry in a `Finding`/`ImpactResponse` falls inside the issuing
-agent's declared `OWNS` list
+**Build:** a method on `SMEAgentBase` (used by every agent on itself, not
+a separate service) that checks any `codepaths` it's about to cite in a
+`Finding`/`ImpactResponse` against its own declared `OWNS` list before
+sending it out
 
 **Unit tests:**
 - `test_citation_matching_an_owned_exact_path_passes`
-- `test_citation_matching_an_owned_prefix_path_passes` — e.g. an owned
-  path of `core/coordinator/group/` matches a cited file
-  `core/coordinator/group/GroupMetadata.scala`
-- `test_citation_outside_all_owned_paths_is_flagged_needs_verification`
-- `test_empty_codepaths_list_passes_trivially`
+- `test_citation_matching_an_owned_prefix_path_passes`
+- `test_citation_outside_owned_paths_is_flagged_needs_verification`
 
 **Integration tests:**
 - `test_validator_against_consumer_team_runbook_fixture` — load the real
-  `OWNS` list from `runbooks/consumer-team-sme.md`'s corresponding agent
-  manifest, and confirm a citation of `GroupCoordinator.scala` passes while
-  a citation of `OffsetClampingService.java` (which belongs to
-  `kora-global`) is correctly flagged
-
-**Manual validation:** run the validator against the three canned
-`ImpactResponse` payloads from the Part V walkthrough and confirm all
-pass (since that walkthrough was written to be internally consistent).
+  `OWNS` list from `consumer-team`'s manifest, confirm a citation of
+  `GroupCoordinator.scala` passes while a citation of
+  `OffsetClampingService.java` (which belongs to `kora-global`) is
+  correctly flagged
 
 **Definition of done for Phase 2:** the proto compiles and round-trips
-correctly, and the ownership validator correctly distinguishes valid from
-invalid citations using the real runbooks as ground truth — not synthetic
-fixtures invented just for the test.
+correctly, and every agent correctly self-flags citations outside its own
+ownership using the real runbooks as ground truth.
 
 ## 22. Phase 3 — Base Agent Framework
 
-### 22.1 Slice: `SMEAgentBase` and the `@tool` Decorator
+### 22.1 Slice: `SMEAgentBase`, the `@tool` Decorator, and Both Workflows
 
-**Build:** `agents/base_agent.py`
+**Build:** `agents/base_agent.py` implementing:
+- `OwnTicket(ticket)` — the workflow used when this agent owns the ticket:
+  investigate with its own tools, decide who else to consult via the
+  Knowledge Graph, send `ImpactRequest`s, assemble the final result
+- `ConsultAbout(request)` — the workflow used when another agent consults
+  this one: run relevant tools, decide (on its own) whether it needs to
+  consult a third agent, respond
 
 **Unit tests:**
 - `test_tool_decorator_registers_method_under_given_name`
-- `test_get_tools_lists_every_decorated_method_on_the_instance`
-- `test_registering_two_tools_with_the_same_name_raises_configuration_error`
-- `test_tool_docstring_is_exposed_as_tool_description`
+- `test_own_ticket_calls_investigate_before_deciding_who_to_consult`
+- `test_own_ticket_only_consults_agents_returned_by_the_knowledge_graph_lookup`
+- `test_consult_about_can_itself_trigger_a_further_consult_about_call`
+- `test_consultation_depth_is_bounded_to_avoid_infinite_chains` — construct
+  a pathological fixture where two mocked agents keep consulting each
+  other and assert it stops instead of running forever
 
 **Integration tests:**
-- `test_agent_boot_calls_register_agent_on_orchestrator` — start a stub
-  gRPC `Orchestrator` server that records incoming `RegisterAgent` calls,
-  boot a minimal test agent subclass against it, assert exactly one
-  `AgentManifest` was received with the correct `agent_name` and tool list
+- `test_own_ticket_end_to_end_against_two_mocked_peer_agents` — mock
+  `consumer-team` and `oss-kafka` to return the exact canned responses from
+  Part V, run `kora_global_agent.OwnTicket()` for real, and assert the
+  resulting plan matches §11's `execution_order` and `approvals_needed`
 
 **Manual validation:**
 ```bash
-python -m agents.tests.fixtures.dummy_agent --orchestrator-addr localhost:50050
-# in another terminal, hit the stub orchestrator's registry endpoint and
-# confirm "dummy-agent" with its 2 dummy tools shows up
+python -m agents.kora_global_agent --own-ticket fixtures/consumer_groups_ticket.json
+# expect the full consultation sequence to run against mocked peers and
+# print a final plan matching Part V
 ```
 
-**Definition of done:** a minimal fixture agent with two dummy `@tool`
-methods boots, registers itself, and its manifest is visible in a test
-Orchestrator's registry within two seconds of boot.
+**Definition of done for Phase 3:** the integration test above is green —
+this is the mocked version of the entire Part V walkthrough passing as an
+automated test before a single *real* peer agent exists.
 
-### 22.2 Slice: Domain Memory Loader
+## 23. Phase 4 — Ticket Router (Thin Intake)
 
-**Build:** agent boot logic that reads the corresponding
-`runbooks/<agent-name>-sme.md` file and extracts the declared `OWNS` paths
-and `DOMAIN` description used by the classifier (§23.2)
-
-**Unit tests:**
-- `test_parses_owns_paths_from_runbook_convention`
-- `test_missing_runbook_file_raises_a_clear_configuration_error`
-- `test_malformed_runbook_missing_domain_section_raises_clear_error`
-
-**Definition of done for Phase 3:** the three real agents
-(`kora-global`, `consumer-team`, `oss-kafka`) each boot successfully,
-correctly load their declared ownership paths from their real runbook
-files (not hardcoded in the agent's Python source), and register with a
-running Orchestrator.
-
-## 23. Phase 4 — Orchestrator Core
-
-### 23.1 Slice: Agent Registry
-
-**Build:** `orchestrator/registry.py`
+**Build:** `router/main.py` — reads the team assignment off an incoming
+ticket and forwards it via gRPC to that team's agent's `OwnTicket()`
+method; maintains a simple static or config-driven `team_name → grpc_addr`
+mapping
 
 **Unit tests:**
-- `test_register_agent_adds_new_entry`
-- `test_re_registering_the_same_agent_name_updates_rather_than_duplicates`
-- `test_list_agents_returns_every_currently_registered_agent`
-- `test_lookup_by_owned_path_returns_correct_agent`
-
-### 23.2 Slice: Knowledge-Graph-Driven Classifier
-
-**Build:** `orchestrator/classifier.py`
-
-**Unit tests:**
-- `test_extracts_likely_codepath_or_component_mentions_from_ticket_text`
-- `test_maps_extracted_mention_to_owning_agent_via_knowledge_graph_query`
-- `test_falls_back_to_keyword_match_against_agent_domain_strings_when_graph_has_no_hit`
+- `test_router_extracts_team_field_from_normalized_ticket`
+- `test_router_maps_team_name_to_correct_agent_address`
+- `test_router_returns_a_clear_error_for_an_unknown_team`
 
 **Integration tests:**
-- `test_classify_consumer_groups_ticket_selects_all_three_agents` — feed
-  in the *exact* ticket text used throughout Part V ("Cluster Linking
-  offset clamping during failover is too slow...") against a Knowledge
-  Graph seeded from the three real runbooks, and assert the classifier
-  selects exactly `{kora-global, consumer-team, oss-kafka}` — no more, no
-  fewer
+- `test_router_forwards_ticket_and_streams_agent_progress_back_to_caller`
 
-**Definition of done:** the integration test above is green using the real
-seeded graph from Phase 1, not a mocked classifier response.
+**Manual validation:**
+```bash
+curl -N -X POST http://localhost:8080/tickets \
+  -H 'content-type: application/json' \
+  -d '{"team": "kora-global", "title": "clampOffsets is slow", ...}'
+# expect to see kora-global's progress stream, not a classification step
+```
 
-### 23.3 Slice: Consultation Loop
-
-**Build:** `orchestrator/consultation.py`
-
-**Unit tests:**
-- `test_investigate_is_called_on_every_classified_agent_in_parallel` —
-  assert wall-clock time is closer to the slowest single agent than to
-  the sum of all agents (proves parallelism, not just correctness)
-- `test_impact_request_is_routed_to_the_agent_named_in_needs_from`
-- `test_consultation_loop_terminates_after_a_max_hop_count` — construct a
-  pathological fixture where two mocked agents keep citing each other in
-  `needs_from` and assert the loop stops instead of running forever
-
-**Integration tests:**
-- `test_full_consultation_matches_part_v_structure` — mock the three
-  agents to return the exact canned `Finding`/`ImpactResponse` payloads
-  shown in the Part V walkthrough, run the consultation loop for real, and
-  assert the resulting message sequence matches: kora-global investigates
-  first, then sends an `ImpactRequest` to consumer-team, which forwards a
-  derived question to oss-kafka
-
-### 23.4 Slice: `TriageResult` Assembly
-
-**Build:** the assembly step inside `orchestrator/main.py`
-
-**Unit tests:**
-- `test_requires_human_is_true_when_any_finding_carries_unresolved_open_questions_above_a_confidence_threshold`
-- `test_execution_order_places_blocking_agents_before_the_agents_they_block`
-- `test_approvals_needed_is_deduplicated_across_multiple_findings`
-
-**Definition of done for Phase 4:** running `TriageTicket()` against the
-three *mocked* agents (using their Part V canned responses) produces a
-`TriageResult` whose `execution_order` has five steps in the correct
-order, whose `approvals_needed` contains exactly the two names from §10,
-and whose `requires_human` is `true` with a non-empty
-`escalation_reason` — i.e., the mocked version of the full Part V
-walkthrough passes as an automated test before a single real agent exists.
+**Definition of done for Phase 4:** a ticket explicitly assigned to
+`kora-global` reaches the `kora-global` agent and nothing else, with zero
+domain-classification logic in the router itself.
 
 ## 24. Phase 5 — First Three SME Agents (Real Tools, Real Data)
 
-Each of the three agents gets the same test structure. Below is the
-pattern; apply it once per agent using each agent's runbook as the tool
-specification.
+Each of the three agents gets the same test structure, using its own
+runbook as the tool specification.
 
 ### 24.1 `kora-global` agent
 
 **Build:** `agents/kora_global_agent.py` implementing the four tools from
-[`runbooks/kora-global-sme.md`](./runbooks/kora-global-sme.md):
-`get_failover_latency`, `get_offset_clamp_trace`, `list_active_links`,
-`get_consumer_groups_for_link`
+[`runbooks/kora-global-sme.md`](./runbooks/kora-global-sme.md)
 
 **Unit tests** (MCP calls mocked):
 - `test_get_failover_latency_returns_the_documented_json_shape`
 - `test_get_offset_clamp_trace_returns_phase_breakdown_summing_to_total_ms`
-- `test_investigate_produces_a_finding_with_needs_from_consumer_team_and_oss_kafka`
+- `test_own_ticket_produces_an_impact_request_addressed_to_consumer_team`
 
-**Integration tests** (against a real running MCP server, using its stub
-executor — see the existing `mcp-server/tools.py`):
+**Integration tests** (against a real running MCP server):
 - `test_kora_global_tools_successfully_call_real_mcp_endpoints_and_parse_responses`
 
 ### 24.2 `consumer-team` agent
 
-**Build:** `agents/consumer_team_agent.py` implementing
-`get_group_state`, `get_groups_for_topic_partition`,
-`get_offset_storage_schema`, `estimate_index_memory_cost`,
-`get_rebalance_history` from
-[`runbooks/consumer-team-sme.md`](./runbooks/consumer-team-sme.md)
+**Build:** `agents/consumer_team_agent.py` implementing the five tools
+from [`runbooks/consumer-team-sme.md`](./runbooks/consumer-team-sme.md)
 
 **Unit tests:**
-- `test_estimate_index_memory_cost_matches_the_documented_formula` — feed
-  in `group_count=50000, avg_subscriptions=8` and assert the result
-  matches the ~14MB figure worked out by hand in the runbook
-- `test_get_offset_storage_schema_returns_the_documented_key_value_format`
+- `test_estimate_index_memory_cost_matches_the_documented_formula`
+- `test_consult_about_recognizes_it_needs_oss_kafka_and_issues_a_further_request`
 
 **Integration tests:**
-- `test_consultabout_responds_correctly_to_a_kora_global_impact_request` —
+- `test_consult_about_responds_correctly_to_a_kora_global_impact_request` —
   send the exact `ImpactRequest` JSON from §8, assert the response
   contains `open_questions: ["needs a new Kafka API version — ask oss-kafka"]`
+  **and** that a follow-up `ImpactRequest` to `oss-kafka` was actually sent
 
 ### 24.3 `oss-kafka` agent
 
-**Build:** `agents/oss_kafka_agent.py` implementing `search_kips`,
-`get_api_spec`, `check_compat`, `get_kip_template` from
+**Build:** `agents/oss_kafka_agent.py` implementing the four tools from
 [`runbooks/oss-kafka-sme.md`](./runbooks/oss-kafka-sme.md)
 
 **Unit tests:**
 - `test_search_kips_ranks_kip_518_as_closest_precedent_for_the_fixture_query`
-  (using a small fixture KIP index checked into
-  `agents/tests/fixtures/kip_index.json`, not a live network call to the
-  real Apache wiki)
 - `test_check_compat_flags_the_kip_848_compatibility_note`
 
 **Definition of done for Phase 5:** each agent, run standalone against a
-locally running MCP server, produces a `Finding` whose content matches —
-not word for word, but in the substantive claims — the corresponding
-agent's step in the Part V walkthrough.
+locally running MCP server, produces output matching — in substance, not
+word for word — the corresponding agent's step in the Part V walkthrough.
 
 ## 25. Phase 6 — Full Multi-Agent Integration Test (No Mocks)
 
-This is the single most important test in the whole plan: it replays
-Part V's walkthrough for real, against real running services, with no
-mocked agents anywhere.
+The single most important test in the whole plan: it replays Part V for
+real, against real running services, with no mocked agents anywhere, and
+with `kora-global` genuinely driving the ticket itself.
 
 **Build:** `tests/integration/test_consumer_groups_per_topic_e2e.py`
 
 **Setup:**
 ```bash
-docker compose up -d   # real Orchestrator, all 3 real agents,
-                       # real MCP server, real Knowledge Graph
-                       # seeded from the 3 real runbooks
+docker compose up -d   # router, all 3 real agents, real MCP server,
+                       # real Knowledge Graph seeded from the 3 runbooks
 ```
 
 **Test steps:**
-1. `POST` the exact ticket text from Part V to the API Gateway
-2. Collect the streamed `Finding` events
-3. Assert:
-   - all three agents (`kora-global`, `consumer-team`, `oss-kafka`)
-     appear in the stream, in that causal order
-   - the final `TriageResult.execution_order` has exactly the five steps
-     from §10, in the same order
-   - `approvals_needed` contains `consumer-team lead` and
-     `oss-kafka committer` (allowing for reasonable string variation)
-   - `requires_human == true`
-4. Run `ownership_validator` (§21.2) against every codepath cited across
-   every finding in the run and assert zero `needs_verification` flags
+1. `POST` the exact ticket from Part V to the API Gateway, with
+   `team: kora-global` explicitly set
+2. Confirm the router sends it straight to `kora-global` and nowhere else
+3. Collect the stream of cross-agent messages that `kora-global` triggers
+   on its own — assert `consumer-team` and then `oss-kafka` appear, in
+   that causal order, without either of them being pre-selected by
+   anything other than `kora-global`'s own Knowledge Graph lookup and
+   `consumer-team`'s own follow-up decision
+4. Assert the final plan `kora-global` produces has exactly the five
+   `execution_order` steps from §11, in the same order
+5. Assert `approvals_needed` contains `consumer-team lead` and
+   `oss-kafka committer`, and `requires_human == true`
+6. Assert every codepath cited across every message in the run passes
+   each agent's own ownership self-validation (§21.2) — zero unflagged
+   out-of-bounds citations
 
 **Definition of done for Phase 6:** a single command,
 `pytest tests/integration/test_consumer_groups_per_topic_e2e.py -v`,
-passes against the live `docker compose` stack. From this point forward,
-this test is the regression guard — it must stay green through every
-subsequent phase, because it's the concrete proof that the abstract
-architecture in Parts I–IV actually works end to end.
+passes against the live `docker compose` stack, with `kora-global`
+genuinely driving its own ticket and genuinely deciding — not being told —
+who else to involve. From this point forward, this test is the permanent
+regression guard for the whole system.
 
 ## 26. Phase 7 — API Gateway
 
 ### 26.1 Slice: Ticket Normalization
 
-**Build:** `gateway/main.py` — endpoints that accept GitHub, Jira, or raw
-JSON payloads and normalize them into the `Ticket` proto
+**Build:** `router/main.py` — endpoints that accept GitHub, Jira, or raw
+JSON payloads and normalize them into the `Ticket` proto, preserving
+whichever team field the source system provides
 
 **Unit tests:**
-- `test_normalize_github_issue_webhook_payload`
-- `test_normalize_jira_webhook_payload`
-- `test_normalize_raw_manual_post_payload`
+- `test_normalize_github_issue_webhook_payload_preserves_team_label`
+- `test_normalize_jira_webhook_payload_preserves_team_field`
 - `test_malformed_payload_returns_400_with_a_clear_error_message`
+- `test_payload_missing_a_team_assignment_returns_a_clear_error` — this
+  system has no fallback classifier, so a ticket with no team is a
+  configuration error, not something to guess about
 
 ### 26.2 Slice: Streaming Response
 
 **Integration tests:**
-- `test_client_receives_partial_findings_before_the_final_triage_result` —
-  assert at least one `Finding` event arrives measurably before the
-  connection closes with the final `TriageResult`
+- `test_client_receives_partial_progress_before_the_final_plan`
 
 **Manual validation:**
 ```bash
 curl -N -X POST http://localhost:8080/tickets \
   -H 'content-type: application/json' \
   -d @fixtures/consumer_groups_ticket.json
-# expect to see Finding events stream in one at a time, followed by
-# a final TriageResult event
 ```
 
-**Definition of done for Phase 7:** the manual `curl` command above
-visibly streams partial results rather than blocking silently until
-everything is done.
+**Definition of done for Phase 7:** the manual `curl` command visibly
+streams `kora-global`'s progress rather than blocking silently, and a
+ticket without a team assignment is rejected rather than silently guessed.
 
 ## 27. Phase 8 — Hypothesis Validation Harness
 
-This phase is different in kind from the previous ones: its purpose is
-not to verify that code behaves as specified, but to test the actual
-product hypothesis from §4. There is no "unit test" for a hypothesis —
-instead, this phase builds a small evaluation harness and a scoring
-report.
+This phase tests the actual product hypothesis from §4, not code
+correctness. There is no unit test for a hypothesis — instead, this phase
+builds a small evaluation harness and a scoring report.
 
 **Build:**
-- `eval/tickets/` — 10–20 real or realistic tickets (the consumer-groups-
-  per-topic ticket plus similar-shaped ones), each with a human-labeled
-  ground truth: which teams should actually be involved, and why
-- `eval/run_comparison.py` — runs every ticket through (a) this
-  multi-agent system and (b) a single large-context-window agent given the
-  same ticket and full repository read access
-- `eval/scoring.py` — scores both runs against the ground truth on:
-  - **recall** — of the teams that should have been identified, how many
-    were actually caught
-  - **precision** — of the teams identified, how many were actually
-    relevant (catches over-escalation)
-  - **time to answer**
-  - **confidence calibration** — did a high confidence score actually
-    correlate with a correct answer, across both systems
+- `eval/tickets/` — 10–20 real or realistic tickets, each already assigned
+  to an owning team the way a real ticket would be, with a human-labeled
+  ground truth of which *other* teams should actually get consulted
+- `eval/run_comparison.py` — runs every ticket through (a) the owning
+  agent driving itself, consulting peers as it decides to, and (b) a
+  single large-context-window agent given the same ticket and full
+  repository access
+- `eval/scoring.py` — scores both on: recall of teams that should have
+  been consulted, precision (catches over-escalation), time to answer,
+  and confidence calibration
 
-**"Tests" for this phase are regression thresholds, not pass/fail unit
-tests:**
+**Checks for this phase:**
+- `test_eval_harness_runs_all_fixture_tickets_without_crashing`
 - `test_multiagent_recall_does_not_regress_below_baseline_run` — once a
   first baseline number exists, CI fails if a later change drops recall
   below it
-- `test_eval_harness_runs_all_fixture_tickets_without_crashing` — the one
-  true unit-test-shaped check in this phase; the harness itself must be
-  reliable even before its output is meaningful
 
-**Definition of done for Phase 8:** `eval/results/report.md` is generated
-automatically and shows, ticket by ticket, whether the multi-agent system
-caught cross-team impacts that the single-agent baseline missed (or vice
-versa). **This report is the actual decision gate** for whether Phase 2 of
-the rollout (§13 — drafting real code changes) is worth building at all.
+**Definition of done for Phase 8:** `eval/results/report.md` shows,
+ticket by ticket, whether letting the owning agent consult peers on its
+own initiative caught cross-team dependencies that the single-agent
+baseline missed. **This report is the actual decision gate** for whether
+Phase 2 of the rollout (§13) is worth building at all.
 
 ## 28. Test Pyramid Summary
 
 | Phase | Unit tests | Integration tests | Special |
 |---|---|---|---|
-| 1 — Knowledge Graph | ~15 | ~6 | — |
-| 2 — Typed Protocol | ~7 | ~3 | — |
-| 3 — Base Agent Framework | ~7 | ~1 | — |
-| 4 — Orchestrator Core | ~12 | ~2 | — |
-| 5 — Three SME Agents | ~15 (5 per agent) | ~6 (2 per agent) | — |
+| 1 — Knowledge Graph | ~12 | ~6 | — |
+| 2 — Typed Protocol | ~6 | ~3 | — |
+| 3 — Base Agent Framework | ~5 | ~1 | — |
+| 4 — Ticket Router | ~3 | ~1 | — |
+| 5 — Three SME Agents | ~12 (4 per agent) | ~6 (2 per agent) | — |
 | 6 — Full Integration | 0 | 1 (but the most important one) | — |
 | 7 — API Gateway | ~4 | ~1 | — |
-| 8 — Hypothesis Validation | ~1 | — | Evaluation harness + scoring report |
+| 8 — Hypothesis Validation | ~2 | — | Evaluation harness + scoring report |
 
-The shape of this pyramid is intentional: most of the volume is unit
-tests on individual tools and validators (cheap, fast, run on every save),
-a smaller number of integration tests confirm the real infrastructure
-wiring (Postgres, gRPC, MCP), and there is exactly **one** load-bearing
-end-to-end test (Phase 6) that proves the whole system works together —
-everything after that treats it as a non-negotiable regression guard.
+Most of the volume is unit tests on individual tools and the ownership
+self-validation logic (cheap, fast, run on every save); a smaller number
+of integration tests confirm the real infrastructure wiring (Postgres,
+gRPC, MCP); and there is exactly **one** load-bearing end-to-end test
+(Phase 6) that proves an agent can actually drive its own ticket through a
+real, undirected, multi-hop consultation — everything after that treats
+it as a non-negotiable regression guard.
 
 ## 29. CI Gate Checklist
 
@@ -1572,11 +1546,10 @@ Before merging any change that touches a given phase's code:
 
 - [ ] Every unit test for that phase passes
 - [ ] Every integration test for that phase passes
-- [ ] The Phase 6 end-to-end test (§25) still passes, once it exists —
-      it is the permanent regression guard for the whole system
-- [ ] `ownership_validator` reports zero new `needs_verification` flags
-      introduced by the change
+- [ ] The Phase 6 end-to-end test (§25) still passes, once it exists
+- [ ] Every agent's ownership self-validation reports zero new
+      `needs_verification` flags introduced by the change
 - [ ] If the change touches an agent's tools, that agent's runbook in
       `runbooks/` is updated to match — the runbook and the code must
-      never drift apart, since the runbook is the source of truth other
-      agents and the classifier rely on
+      never drift apart, since it's the source of truth the Knowledge
+      Graph and every other agent rely on
