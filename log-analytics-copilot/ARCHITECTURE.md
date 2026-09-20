@@ -1038,3 +1038,545 @@ answering that question risks building an elaborate architecture that a
 much simpler system would have matched just as well. Phase 1 of the
 rollout (§13) exists specifically to settle that question honestly before
 any further investment.
+
+---
+
+# Part IX — Implementation & Validation Plan
+
+Part VII gave the high-level roadmap (Phase 0 through Phase 4). This part
+turns that roadmap into buildable slices small enough to implement in a
+day or two each, with an explicit test suite gating every slice. **Nothing
+in this plan is considered "done" until its tests are green** — the tests
+are the actual definition of done, not a nice-to-have added afterward.
+
+## 19. How to Use This Plan
+
+Each numbered phase below maps onto Part VII's roadmap, broken into
+smaller slices. Every slice has the same five parts:
+
+- **Build** — the file(s) to create
+- **Unit tests** — fast, no network/DB/Docker, test one function in isolation
+- **Integration tests** — real Postgres / real gRPC / real MCP server, but
+  still automated and fast enough to run on every commit
+- **Manual validation** — a command you can run by hand to sanity-check
+  the slice before trusting the automated tests
+- **Definition of done** — the specific, checkable condition that means
+  this slice is genuinely finished, not just "code exists"
+
+Work through the phases in order — each one depends on the previous one
+existing and passing its tests. Do not start Phase 2 with Phase 1's tests
+red; that debt compounds badly in a multi-agent system where later phases
+depend on earlier ones being trustworthy, not just present.
+
+## 20. Phase 1 — Knowledge Graph Foundation
+
+### 20.1 Slice: Postgres Schema
+
+**Build:** `knowledge-graph/schema.sql`, `knowledge-graph/db.py` (connection
+pool + a small migration runner that applies `schema.sql` idempotently)
+
+**Unit tests** (`knowledge-graph/tests/test_schema.py`, no live DB needed —
+test the SQL string / migration logic itself):
+- `test_schema_sql_is_valid_syntax` — parse the file with a SQL parser
+  (e.g. `sqlparse`) and assert no syntax errors
+- `test_migration_is_idempotent_on_repeat_apply` — running the migration
+  runner twice against a mocked cursor issues `CREATE TABLE IF NOT EXISTS`
+
+**Integration tests** (`knowledge-graph/tests/test_schema_integration.py`,
+against a real throwaway Postgres — spin one up with
+`docker run -d postgres:16` in a test fixture):
+- `test_entities_and_edges_tables_exist_after_migration`
+- `test_edge_from_id_and_to_id_enforce_foreign_key` — inserting an edge
+  with a nonexistent `from_id` raises an integrity error
+- `test_edge_confidence_defaults_to_one_point_zero`
+- `test_indexes_exist_on_edges_from_and_to` — query
+  `pg_indexes` and assert `idx_edges_from` / `idx_edges_to` are present
+
+**Manual validation:**
+```bash
+docker run -d --name kg-test -e POSTGRES_PASSWORD=test -p 5433:5432 postgres:16
+psql postgresql://postgres:test@localhost:5433/postgres -f knowledge-graph/schema.sql
+psql postgresql://postgres:test@localhost:5433/postgres -c '\dt'
+# expect to see: entities, edges
+```
+
+**Definition of done:** `pytest knowledge-graph/tests/test_schema*.py -v`
+is fully green, and the manual `\dt` shows both tables with the indexes
+from §7 present.
+
+### 20.2 Slice: GitHub Ingestion
+
+**Build:** `knowledge-graph/ingest_github.py` — parses `CODEOWNERS` files
+and recent PR metadata, writes `Team --owns--> Repository/CodePath` edges
+
+**Unit tests:**
+- `test_parses_codeowners_line_into_pattern_and_owner`
+- `test_ignores_comment_lines_and_blank_lines`
+- `test_maps_wildcard_pattern_to_codepath_entity_with_correct_metadata`
+- `test_pr_description_with_no_owner_mention_produces_no_decision_edge`
+
+**Integration tests** (against a small fixture repo checked into
+`knowledge-graph/tests/fixtures/sample-repo/`, containing a real
+`CODEOWNERS` file and a couple of commits):
+- `test_ingest_produces_owns_edge_for_each_codeowners_entry`
+- `test_ingest_is_re_runnable_without_duplicating_edges` — run twice,
+  assert edge count is unchanged, `last_seen_at` is updated instead
+
+**Manual validation:**
+```bash
+python -m knowledge_graph.ingest_github --repo runbooks/ --dry-run
+# expect printed edges like:
+# Team(consumer-team) --owns--> CodePath(core/src/.../GroupCoordinator.scala)
+```
+
+**Definition of done:** running the ingestor against the three existing
+runbooks' declared `OWNS` paths produces the exact ownership edges shown
+in §6, verified by an integration test that asserts on the specific edge
+rows, not just "some edges exist."
+
+### 20.3 Slice: Trace-Based Dependency Mining
+
+**Build:** `knowledge-graph/ingest_traces.py` — reads the `service_graph`
+Delta/Gold table produced by the log pipeline (§10) and writes
+`Service --depends_on--> Service` edges weighted by co-occurrence count
+
+**Unit tests:**
+- `test_co_occurrence_row_produces_depends_on_edge_with_matching_weight`
+- `test_self_referential_rows_are_excluded` (`from_service == to_service`)
+- `test_zero_co_occurrence_rows_are_skipped`
+
+**Integration tests** (reuse `scripts/produce-fake-logs.py` to generate a
+known, small set of synthetic logs with controlled `trace_id` overlap
+across services):
+- `test_end_to_end_from_synthetic_logs_produces_expected_edge_count` —
+  produce logs where `service-a` and `service-b` share exactly 5 `trace_id`s
+  and no others, run the full pipeline, assert exactly one `depends_on`
+  edge with weight 5
+
+**Manual validation:**
+```bash
+python -m knowledge_graph.ingest_traces --source delta/service_graph
+psql ... -c "SELECT * FROM edges WHERE relation = 'depends_on' LIMIT 10;"
+```
+
+**Definition of done:** the integration test above is green, and running
+the ingestor against the real Delta data already on disk in this repo
+(from the earlier May 2026 pipeline run) produces at least one
+`depends_on` edge that matches something a human can verify by eye in the
+raw logs.
+
+### 20.4 Slice: Graph Query API
+
+**Build:** `knowledge-graph/query.py` — the functions the Orchestrator
+actually calls: `owning_team(codepath)`, `depends_on(service, depth=1)`,
+`must_approve(change_type)`
+
+**Unit tests** (against a small in-memory or SQLite-backed fixture graph,
+not Postgres — these should be fast):
+- `test_owning_team_returns_correct_team_for_exact_path_match`
+- `test_owning_team_returns_none_for_unknown_path`
+- `test_depends_on_respects_requested_depth`
+- `test_depends_on_returns_edges_sorted_by_confidence_descending`
+
+**Integration tests** (seed a real Postgres test DB with the ownership
+edges from §20.2 using the three real runbooks):
+- `test_owning_team_of_list_groups_returns_consumer_team` — this is the
+  literal example from §10: `owning_team("ListGroups")` must return
+  `"consumer-team"`
+- `test_owning_team_of_clamp_offsets_returns_kora_global` — likewise,
+  `owning_team("clampOffsets")` must return `"kora-global"`
+
+**Manual validation:**
+```bash
+python -c "
+from knowledge_graph.query import owning_team
+print(owning_team('ListGroups'))    # expect: consumer-team
+print(owning_team('clampOffsets'))  # expect: kora-global
+"
+```
+
+**Definition of done for Phase 1:** all tests across 20.1–20.4 pass in CI,
+and the two manual query calls above return the correct agent names
+against a graph built entirely from real ingestion — this is the exact
+lookup the Orchestrator performs at `13:42:08` in the Part V walkthrough,
+now backed by real code instead of a narrated example.
+
+## 21. Phase 2 — Typed Protocol
+
+### 21.1 Slice: Proto Definitions
+
+**Build:** `proto/sme_agents.proto` (the schema from §8), plus generated
+Python stubs via `protoc`
+
+**Unit tests** (`proto/tests/test_messages.py`):
+- `test_impact_request_round_trips_through_serialize_and_parse`
+- `test_impact_response_open_questions_defaults_to_empty_list`
+- `test_finding_confidence_field_accepts_float_between_0_and_1`
+
+**Integration tests:**
+- `test_protoc_generates_python_stubs_without_error` — actually invoke
+  `protoc` in the test (or as a pre-test build step) and import the result
+- `test_grpc_channel_can_send_impact_request_to_stub_server` — spin up a
+  minimal test gRPC server that echoes the request back, confirm the
+  message survives the wire round trip unchanged
+
+**Manual validation:**
+```bash
+python -c "
+from proto import sme_agents_pb2 as pb
+m = pb.ImpactRequest(from_agent='kora-global', to_agent='consumer-team',
+                      request_type='impact_analysis')
+print(m)
+"
+```
+
+**Definition of done:** `protoc` compiles cleanly, and the manual command
+above prints a well-formed message with the fields set as expected.
+
+### 21.2 Slice: Ownership Validator
+
+**Build:** `orchestrator/ownership_validator.py` — checks that every
+`codepaths` entry in a `Finding`/`ImpactResponse` falls inside the issuing
+agent's declared `OWNS` list
+
+**Unit tests:**
+- `test_citation_matching_an_owned_exact_path_passes`
+- `test_citation_matching_an_owned_prefix_path_passes` — e.g. an owned
+  path of `core/coordinator/group/` matches a cited file
+  `core/coordinator/group/GroupMetadata.scala`
+- `test_citation_outside_all_owned_paths_is_flagged_needs_verification`
+- `test_empty_codepaths_list_passes_trivially`
+
+**Integration tests:**
+- `test_validator_against_consumer_team_runbook_fixture` — load the real
+  `OWNS` list from `runbooks/consumer-team-sme.md`'s corresponding agent
+  manifest, and confirm a citation of `GroupCoordinator.scala` passes while
+  a citation of `OffsetClampingService.java` (which belongs to
+  `kora-global`) is correctly flagged
+
+**Manual validation:** run the validator against the three canned
+`ImpactResponse` payloads from the Part V walkthrough and confirm all
+pass (since that walkthrough was written to be internally consistent).
+
+**Definition of done for Phase 2:** the proto compiles and round-trips
+correctly, and the ownership validator correctly distinguishes valid from
+invalid citations using the real runbooks as ground truth — not synthetic
+fixtures invented just for the test.
+
+## 22. Phase 3 — Base Agent Framework
+
+### 22.1 Slice: `SMEAgentBase` and the `@tool` Decorator
+
+**Build:** `agents/base_agent.py`
+
+**Unit tests:**
+- `test_tool_decorator_registers_method_under_given_name`
+- `test_get_tools_lists_every_decorated_method_on_the_instance`
+- `test_registering_two_tools_with_the_same_name_raises_configuration_error`
+- `test_tool_docstring_is_exposed_as_tool_description`
+
+**Integration tests:**
+- `test_agent_boot_calls_register_agent_on_orchestrator` — start a stub
+  gRPC `Orchestrator` server that records incoming `RegisterAgent` calls,
+  boot a minimal test agent subclass against it, assert exactly one
+  `AgentManifest` was received with the correct `agent_name` and tool list
+
+**Manual validation:**
+```bash
+python -m agents.tests.fixtures.dummy_agent --orchestrator-addr localhost:50050
+# in another terminal, hit the stub orchestrator's registry endpoint and
+# confirm "dummy-agent" with its 2 dummy tools shows up
+```
+
+**Definition of done:** a minimal fixture agent with two dummy `@tool`
+methods boots, registers itself, and its manifest is visible in a test
+Orchestrator's registry within two seconds of boot.
+
+### 22.2 Slice: Domain Memory Loader
+
+**Build:** agent boot logic that reads the corresponding
+`runbooks/<agent-name>-sme.md` file and extracts the declared `OWNS` paths
+and `DOMAIN` description used by the classifier (§23.2)
+
+**Unit tests:**
+- `test_parses_owns_paths_from_runbook_convention`
+- `test_missing_runbook_file_raises_a_clear_configuration_error`
+- `test_malformed_runbook_missing_domain_section_raises_clear_error`
+
+**Definition of done for Phase 3:** the three real agents
+(`kora-global`, `consumer-team`, `oss-kafka`) each boot successfully,
+correctly load their declared ownership paths from their real runbook
+files (not hardcoded in the agent's Python source), and register with a
+running Orchestrator.
+
+## 23. Phase 4 — Orchestrator Core
+
+### 23.1 Slice: Agent Registry
+
+**Build:** `orchestrator/registry.py`
+
+**Unit tests:**
+- `test_register_agent_adds_new_entry`
+- `test_re_registering_the_same_agent_name_updates_rather_than_duplicates`
+- `test_list_agents_returns_every_currently_registered_agent`
+- `test_lookup_by_owned_path_returns_correct_agent`
+
+### 23.2 Slice: Knowledge-Graph-Driven Classifier
+
+**Build:** `orchestrator/classifier.py`
+
+**Unit tests:**
+- `test_extracts_likely_codepath_or_component_mentions_from_ticket_text`
+- `test_maps_extracted_mention_to_owning_agent_via_knowledge_graph_query`
+- `test_falls_back_to_keyword_match_against_agent_domain_strings_when_graph_has_no_hit`
+
+**Integration tests:**
+- `test_classify_consumer_groups_ticket_selects_all_three_agents` — feed
+  in the *exact* ticket text used throughout Part V ("Cluster Linking
+  offset clamping during failover is too slow...") against a Knowledge
+  Graph seeded from the three real runbooks, and assert the classifier
+  selects exactly `{kora-global, consumer-team, oss-kafka}` — no more, no
+  fewer
+
+**Definition of done:** the integration test above is green using the real
+seeded graph from Phase 1, not a mocked classifier response.
+
+### 23.3 Slice: Consultation Loop
+
+**Build:** `orchestrator/consultation.py`
+
+**Unit tests:**
+- `test_investigate_is_called_on_every_classified_agent_in_parallel` —
+  assert wall-clock time is closer to the slowest single agent than to
+  the sum of all agents (proves parallelism, not just correctness)
+- `test_impact_request_is_routed_to_the_agent_named_in_needs_from`
+- `test_consultation_loop_terminates_after_a_max_hop_count` — construct a
+  pathological fixture where two mocked agents keep citing each other in
+  `needs_from` and assert the loop stops instead of running forever
+
+**Integration tests:**
+- `test_full_consultation_matches_part_v_structure` — mock the three
+  agents to return the exact canned `Finding`/`ImpactResponse` payloads
+  shown in the Part V walkthrough, run the consultation loop for real, and
+  assert the resulting message sequence matches: kora-global investigates
+  first, then sends an `ImpactRequest` to consumer-team, which forwards a
+  derived question to oss-kafka
+
+### 23.4 Slice: `TriageResult` Assembly
+
+**Build:** the assembly step inside `orchestrator/main.py`
+
+**Unit tests:**
+- `test_requires_human_is_true_when_any_finding_carries_unresolved_open_questions_above_a_confidence_threshold`
+- `test_execution_order_places_blocking_agents_before_the_agents_they_block`
+- `test_approvals_needed_is_deduplicated_across_multiple_findings`
+
+**Definition of done for Phase 4:** running `TriageTicket()` against the
+three *mocked* agents (using their Part V canned responses) produces a
+`TriageResult` whose `execution_order` has five steps in the correct
+order, whose `approvals_needed` contains exactly the two names from §10,
+and whose `requires_human` is `true` with a non-empty
+`escalation_reason` — i.e., the mocked version of the full Part V
+walkthrough passes as an automated test before a single real agent exists.
+
+## 24. Phase 5 — First Three SME Agents (Real Tools, Real Data)
+
+Each of the three agents gets the same test structure. Below is the
+pattern; apply it once per agent using each agent's runbook as the tool
+specification.
+
+### 24.1 `kora-global` agent
+
+**Build:** `agents/kora_global_agent.py` implementing the four tools from
+[`runbooks/kora-global-sme.md`](./runbooks/kora-global-sme.md):
+`get_failover_latency`, `get_offset_clamp_trace`, `list_active_links`,
+`get_consumer_groups_for_link`
+
+**Unit tests** (MCP calls mocked):
+- `test_get_failover_latency_returns_the_documented_json_shape`
+- `test_get_offset_clamp_trace_returns_phase_breakdown_summing_to_total_ms`
+- `test_investigate_produces_a_finding_with_needs_from_consumer_team_and_oss_kafka`
+
+**Integration tests** (against a real running MCP server, using its stub
+executor — see the existing `mcp-server/tools.py`):
+- `test_kora_global_tools_successfully_call_real_mcp_endpoints_and_parse_responses`
+
+### 24.2 `consumer-team` agent
+
+**Build:** `agents/consumer_team_agent.py` implementing
+`get_group_state`, `get_groups_for_topic_partition`,
+`get_offset_storage_schema`, `estimate_index_memory_cost`,
+`get_rebalance_history` from
+[`runbooks/consumer-team-sme.md`](./runbooks/consumer-team-sme.md)
+
+**Unit tests:**
+- `test_estimate_index_memory_cost_matches_the_documented_formula` — feed
+  in `group_count=50000, avg_subscriptions=8` and assert the result
+  matches the ~14MB figure worked out by hand in the runbook
+- `test_get_offset_storage_schema_returns_the_documented_key_value_format`
+
+**Integration tests:**
+- `test_consultabout_responds_correctly_to_a_kora_global_impact_request` —
+  send the exact `ImpactRequest` JSON from §8, assert the response
+  contains `open_questions: ["needs a new Kafka API version — ask oss-kafka"]`
+
+### 24.3 `oss-kafka` agent
+
+**Build:** `agents/oss_kafka_agent.py` implementing `search_kips`,
+`get_api_spec`, `check_compat`, `get_kip_template` from
+[`runbooks/oss-kafka-sme.md`](./runbooks/oss-kafka-sme.md)
+
+**Unit tests:**
+- `test_search_kips_ranks_kip_518_as_closest_precedent_for_the_fixture_query`
+  (using a small fixture KIP index checked into
+  `agents/tests/fixtures/kip_index.json`, not a live network call to the
+  real Apache wiki)
+- `test_check_compat_flags_the_kip_848_compatibility_note`
+
+**Definition of done for Phase 5:** each agent, run standalone against a
+locally running MCP server, produces a `Finding` whose content matches —
+not word for word, but in the substantive claims — the corresponding
+agent's step in the Part V walkthrough.
+
+## 25. Phase 6 — Full Multi-Agent Integration Test (No Mocks)
+
+This is the single most important test in the whole plan: it replays
+Part V's walkthrough for real, against real running services, with no
+mocked agents anywhere.
+
+**Build:** `tests/integration/test_consumer_groups_per_topic_e2e.py`
+
+**Setup:**
+```bash
+docker compose up -d   # real Orchestrator, all 3 real agents,
+                       # real MCP server, real Knowledge Graph
+                       # seeded from the 3 real runbooks
+```
+
+**Test steps:**
+1. `POST` the exact ticket text from Part V to the API Gateway
+2. Collect the streamed `Finding` events
+3. Assert:
+   - all three agents (`kora-global`, `consumer-team`, `oss-kafka`)
+     appear in the stream, in that causal order
+   - the final `TriageResult.execution_order` has exactly the five steps
+     from §10, in the same order
+   - `approvals_needed` contains `consumer-team lead` and
+     `oss-kafka committer` (allowing for reasonable string variation)
+   - `requires_human == true`
+4. Run `ownership_validator` (§21.2) against every codepath cited across
+   every finding in the run and assert zero `needs_verification` flags
+
+**Definition of done for Phase 6:** a single command,
+`pytest tests/integration/test_consumer_groups_per_topic_e2e.py -v`,
+passes against the live `docker compose` stack. From this point forward,
+this test is the regression guard — it must stay green through every
+subsequent phase, because it's the concrete proof that the abstract
+architecture in Parts I–IV actually works end to end.
+
+## 26. Phase 7 — API Gateway
+
+### 26.1 Slice: Ticket Normalization
+
+**Build:** `gateway/main.py` — endpoints that accept GitHub, Jira, or raw
+JSON payloads and normalize them into the `Ticket` proto
+
+**Unit tests:**
+- `test_normalize_github_issue_webhook_payload`
+- `test_normalize_jira_webhook_payload`
+- `test_normalize_raw_manual_post_payload`
+- `test_malformed_payload_returns_400_with_a_clear_error_message`
+
+### 26.2 Slice: Streaming Response
+
+**Integration tests:**
+- `test_client_receives_partial_findings_before_the_final_triage_result` —
+  assert at least one `Finding` event arrives measurably before the
+  connection closes with the final `TriageResult`
+
+**Manual validation:**
+```bash
+curl -N -X POST http://localhost:8080/tickets \
+  -H 'content-type: application/json' \
+  -d @fixtures/consumer_groups_ticket.json
+# expect to see Finding events stream in one at a time, followed by
+# a final TriageResult event
+```
+
+**Definition of done for Phase 7:** the manual `curl` command above
+visibly streams partial results rather than blocking silently until
+everything is done.
+
+## 27. Phase 8 — Hypothesis Validation Harness
+
+This phase is different in kind from the previous ones: its purpose is
+not to verify that code behaves as specified, but to test the actual
+product hypothesis from §4. There is no "unit test" for a hypothesis —
+instead, this phase builds a small evaluation harness and a scoring
+report.
+
+**Build:**
+- `eval/tickets/` — 10–20 real or realistic tickets (the consumer-groups-
+  per-topic ticket plus similar-shaped ones), each with a human-labeled
+  ground truth: which teams should actually be involved, and why
+- `eval/run_comparison.py` — runs every ticket through (a) this
+  multi-agent system and (b) a single large-context-window agent given the
+  same ticket and full repository read access
+- `eval/scoring.py` — scores both runs against the ground truth on:
+  - **recall** — of the teams that should have been identified, how many
+    were actually caught
+  - **precision** — of the teams identified, how many were actually
+    relevant (catches over-escalation)
+  - **time to answer**
+  - **confidence calibration** — did a high confidence score actually
+    correlate with a correct answer, across both systems
+
+**"Tests" for this phase are regression thresholds, not pass/fail unit
+tests:**
+- `test_multiagent_recall_does_not_regress_below_baseline_run` — once a
+  first baseline number exists, CI fails if a later change drops recall
+  below it
+- `test_eval_harness_runs_all_fixture_tickets_without_crashing` — the one
+  true unit-test-shaped check in this phase; the harness itself must be
+  reliable even before its output is meaningful
+
+**Definition of done for Phase 8:** `eval/results/report.md` is generated
+automatically and shows, ticket by ticket, whether the multi-agent system
+caught cross-team impacts that the single-agent baseline missed (or vice
+versa). **This report is the actual decision gate** for whether Phase 2 of
+the rollout (§13 — drafting real code changes) is worth building at all.
+
+## 28. Test Pyramid Summary
+
+| Phase | Unit tests | Integration tests | Special |
+|---|---|---|---|
+| 1 — Knowledge Graph | ~15 | ~6 | — |
+| 2 — Typed Protocol | ~7 | ~3 | — |
+| 3 — Base Agent Framework | ~7 | ~1 | — |
+| 4 — Orchestrator Core | ~12 | ~2 | — |
+| 5 — Three SME Agents | ~15 (5 per agent) | ~6 (2 per agent) | — |
+| 6 — Full Integration | 0 | 1 (but the most important one) | — |
+| 7 — API Gateway | ~4 | ~1 | — |
+| 8 — Hypothesis Validation | ~1 | — | Evaluation harness + scoring report |
+
+The shape of this pyramid is intentional: most of the volume is unit
+tests on individual tools and validators (cheap, fast, run on every save),
+a smaller number of integration tests confirm the real infrastructure
+wiring (Postgres, gRPC, MCP), and there is exactly **one** load-bearing
+end-to-end test (Phase 6) that proves the whole system works together —
+everything after that treats it as a non-negotiable regression guard.
+
+## 29. CI Gate Checklist
+
+Before merging any change that touches a given phase's code:
+
+- [ ] Every unit test for that phase passes
+- [ ] Every integration test for that phase passes
+- [ ] The Phase 6 end-to-end test (§25) still passes, once it exists —
+      it is the permanent regression guard for the whole system
+- [ ] `ownership_validator` reports zero new `needs_verification` flags
+      introduced by the change
+- [ ] If the change touches an agent's tools, that agent's runbook in
+      `runbooks/` is updated to match — the runbook and the code must
+      never drift apart, since the runbook is the source of truth other
+      agents and the classifier rely on
