@@ -380,6 +380,65 @@ class TeamInvolvement:
 # ---------------------------------------------------------------------------
 
 @dataclass
+class ImpactSignal:
+    """A consequence the investigating agent believes its change would have.
+
+    Signals are the input to peer discovery. An agent does not name the teams
+    it needs — it names the *consequences* of its proposed change, and the
+    directory resolves those to teams. That is what makes discovery derived
+    rather than hardcoded: an agent that has never heard of the security team
+    still reaches it by declaring that its change affects authorization.
+    """
+
+    concern: str                     # a tag from discovery.CONCERNS
+    evidence: str                    # why this agent believes the signal applies
+    codepath: str = ""               # the specific path implicated, if known
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "concern": self.concern,
+            "evidence": self.evidence,
+            "codepath": self.codepath,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "ImpactSignal":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
+class PeerDecision:
+    """The record of whether a discovered team was consulted, and why.
+
+    One of these is produced for *every* team in the directory, including the
+    ones that were skipped. Recording the skips is the point: it is the
+    evidence that the agent considered a team and had a reason not to spend
+    its time, rather than never having known the team existed.
+    """
+
+    agent_id: str
+    consult: bool
+    reason: str
+    matched_concerns: list[str] = field(default_factory=list)
+    codepath: str = ""               # what to ask them about
+    reachable: bool = True           # False when no agent implements this team
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "agent_id": self.agent_id,
+            "consult": self.consult,
+            "reason": self.reason,
+            "matched_concerns": self.matched_concerns,
+            "codepath": self.codepath,
+            "reachable": self.reachable,
+        }
+
+    @classmethod
+    def from_dict(cls, d: dict[str, Any]) -> "PeerDecision":
+        return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})
+
+
+@dataclass
 class Finding:
     """The assembled result produced by the owning agent after OwnTicket().
 
@@ -415,6 +474,10 @@ class Finding:
 
     cited_codepaths: list[str] = field(default_factory=list)
     open_questions: list[str] = field(default_factory=list)
+
+    # --- peer discovery audit trail ---
+    impact_signals: list[ImpactSignal] = field(default_factory=list)
+    peer_discovery: list[PeerDecision] = field(default_factory=list)
 
     # --- deliberation audit trail ---
     deliberation: list[DeliberationRound] = field(default_factory=list)
@@ -455,6 +518,8 @@ class Finding:
             "confidence": self.confidence,
             "cited_codepaths": self.cited_codepaths,
             "open_questions": self.open_questions,
+            "impact_signals": [s.to_dict() for s in self.impact_signals],
+            "peer_discovery": [p.to_dict() for p in self.peer_discovery],
             "deliberation": [d.to_dict() for d in self.deliberation],
             "rounds_used": self.rounds_used,
             "converged": self.converged,
@@ -479,5 +544,15 @@ class Finding:
             d["deliberation"] = [
                 DeliberationRound.from_dict(r) if isinstance(r, dict) else r
                 for r in d["deliberation"]
+            ]
+        if "impact_signals" in d:
+            d["impact_signals"] = [
+                ImpactSignal.from_dict(s) if isinstance(s, dict) else s
+                for s in d["impact_signals"]
+            ]
+        if "peer_discovery" in d:
+            d["peer_discovery"] = [
+                PeerDecision.from_dict(p) if isinstance(p, dict) else p
+                for p in d["peer_discovery"]
             ]
         return cls(**{k: v for k, v in d.items() if k in cls.__dataclass_fields__})

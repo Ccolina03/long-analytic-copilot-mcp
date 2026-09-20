@@ -35,6 +35,7 @@ from proto.sme_agents import (
     DesignAlternative,
     ImpactRequest,
     ImpactResponse,
+    ImpactSignal,
     TeamInvolvement,
     Ticket,
 )
@@ -410,17 +411,89 @@ class MirrorMakerAgent(SMEAgentBase):
         ]
 
     # ------------------------------------------------------------------
-    # Peer selection + request construction
+    # Peer discovery + request construction
     # ------------------------------------------------------------------
 
-    def _select_peers(
+    def _impact_signals(
         self, ticket: Ticket, investigation: dict[str, Any]
-    ) -> list[tuple[str, str]]:
-        """Return the teams whose code this change would touch."""
+    ) -> list[ImpactSignal]:
+        """Declare what the proposed fix would affect, without naming teams.
+
+        This agent knows MirrorMaker. It does not know which teams own group
+        metadata, request routing, RPC schemas, or ACLs — and it does not need
+        to. It states the consequences of the index-plus-filter design it is
+        proposing, and ``agents.discovery`` resolves each consequence to the
+        team authoritative on it.
+
+        The ``authorization`` signal is the one worth noting: nothing about a
+        replication latency bug suggests a security review. It appears here
+        because the *fix* creates a new read path over which groups consume a
+        topic, and this agent can recognize that consequence without knowing
+        that a security team exists or what it would say.
+        """
+        trace = investigation["trace"]
+        latency = investigation["latency"]
+        matched = trace["phases"][2]["groups_matched"]
+        total = trace["phases"][0]["groups_returned"]
+
         return [
-            ("group-coordinator", "GroupMetadataManager.java"),
-            ("kafka-broker", "KafkaApis.scala"),
-            ("kafka-clients", "ListGroupsRequest.json"),
+            ImpactSignal(
+                concern="group_state_mutation",
+                evidence=(
+                    f"The fix needs a reverse (topic, partition) → group index maintained "
+                    f"alongside consumer group membership, updated as members join, leave, "
+                    f"and time out. That is a new structure inside group metadata, which we "
+                    f"do not own."
+                ),
+                codepath="GroupMetadataManager.java",
+            ),
+            ImpactSignal(
+                concern="wire_protocol",
+                evidence=(
+                    "Exposing the filter to clients means a new optional field on "
+                    "ListGroupsRequest and a version bump, which is a public protocol "
+                    "change subject to compatibility rules we do not control."
+                ),
+                codepath="ListGroupsRequest.json",
+            ),
+            ImpactSignal(
+                concern="public_java_api",
+                evidence=(
+                    "MirrorCheckpointConnector reaches the filter through AdminClient, so "
+                    "`ListConsumerGroupsOptions` needs a new public method."
+                ),
+                codepath="KafkaAdminClient.java",
+            ),
+            ImpactSignal(
+                concern="request_routing",
+                evidence=(
+                    f"A filtered ListGroups still has to be served by brokers. Groups for a "
+                    f"single topic can hash to any coordinator shard, so we need to know "
+                    f"whether the request fans out and whether that undoes the "
+                    f"{latency['p99_ms']}ms → {self.TARGET_DISCOVERY_P99_MS}ms win."
+                ),
+                codepath="KafkaApis.scala",
+            ),
+            ImpactSignal(
+                concern="broker_memory",
+                evidence=(
+                    "The index is resident broker heap that scales with group count — "
+                    "roughly 14MB per 50k-group cluster on our estimate. Someone who owns "
+                    "the broker heap budget has to accept or refuse that."
+                ),
+                codepath="KafkaConfig.scala",
+            ),
+            ImpactSignal(
+                concern="authorization",
+                evidence=(
+                    f"The filter answers 'which groups consume this topic', which is a "
+                    f"question no Kafka API answers today. Our own trace matched {matched} "
+                    f"of {total:,} groups, so the response is a precise map from a topic to "
+                    f"the services reading it. We do not know whether existing ACLs cover "
+                    f"that, and we are not the team to decide."
+                ),
+                codepath="StandardAuthorizer.java",
+            ),
         ]
 
     def _build_impact_request(
@@ -513,6 +586,31 @@ class MirrorMakerAgent(SMEAgentBase):
             return (
                 "Final round: confirm routing and heap are agreed, and that your test "
                 "requirements for the fan-out path are captured."
+            )
+
+        if peer_id == "kafka-security":
+            if round_number == 1:
+                return (
+                    "We found you by working out that this filter answers a question no "
+                    "Kafka API answers today: which consumer groups consume a given topic. "
+                    "We do not know whether the existing ACL model covers that, and it is "
+                    "not our call. Does exposing the topic→group relationship through "
+                    "ListGroups need its own authorization, what should happen when the "
+                    "caller is not authorized on a topic it names in the filter, and does "
+                    "any of this have to be settled before the KIP goes to vote rather "
+                    "than during implementation?"
+                )
+            if round_number == 2:
+                return (
+                    "Confirm the per-topic DESCRIBE check intersected with the existing "
+                    "group-level authorization is the right model, that silently dropping "
+                    "unauthorized topics is what you want rather than an error, and that "
+                    "the hot-path cost is acceptable at the filter sizes MM2 would use."
+                )
+            return (
+                "Final round: confirm the authorization semantics are agreed and tell me "
+                "exactly which parts must be written into the KIP text rather than left to "
+                "the implementation."
             )
 
         # kafka-clients

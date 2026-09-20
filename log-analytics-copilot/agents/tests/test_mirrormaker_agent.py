@@ -7,11 +7,9 @@ deliberation flow against all three real peer agents.
 
 import pytest
 
-from agents.base_agent import DirectTransport, NullTransport
-from agents.group_coordinator_agent import GroupCoordinatorAgent
-from agents.kafka_broker_agent import KafkaBrokerAgent
+from agents.base_agent import NullTransport
 from agents.mirrormaker_agent import MirrorMakerAgent
-from agents.kafka_clients_agent import KafkaClientsAgent
+from agents.network import build_network
 from agents.ownership_validator import validate_citations
 from proto.sme_agents import Ticket
 
@@ -32,21 +30,11 @@ def ticket():
 
 @pytest.fixture
 def full_network():
-    """mirrormaker wired to all three real peers.
+    """mirrormaker wired into the full implemented network.
 
-    group-coordinator gets its own transport because it consults kafka-clients
-    on its own initiative.
+    Which peers it actually consults is decided by discovery, not this fixture.
     """
-    clients = KafkaClientsAgent()
-    broker = KafkaBrokerAgent()
-    coordinator = GroupCoordinatorAgent(
-        transport=DirectTransport({"kafka-clients": clients})
-    )
-    return MirrorMakerAgent(transport=DirectTransport({
-        "group-coordinator": coordinator,
-        "kafka-broker": broker,
-        "kafka-clients": clients,
-    }))
+    return build_network()["mirrormaker"]
 
 
 # ------------------------------------------------------------------
@@ -175,12 +163,16 @@ class TestMirrorMakerInvestigation:
 # ------------------------------------------------------------------
 
 class TestMirrorMakerOwnTicket:
-    def test_consults_all_three_peer_teams(self, full_network, ticket):
+    def test_discovers_and_consults_the_relevant_peers(self, full_network, ticket):
         finding = full_network.own_ticket(ticket)
         consulted = {r.to_agent for r in finding.deliberation}
         assert "group-coordinator" in consulted
         assert "kafka-broker" in consulted
         assert "kafka-clients" in consulted
+        assert "kafka-security" in consulted
+        skipped = {d.agent_id for d in finding.peer_discovery if not d.consult}
+        assert "kafka-storage" in skipped
+        assert "kafka-streams" in skipped
 
     def test_deliberates_over_multiple_rounds(self, full_network, ticket):
         finding = full_network.own_ticket(ticket)
@@ -202,11 +194,11 @@ class TestMirrorMakerOwnTicket:
         unowned = [r.codepath for r in results if not r.owned]
         assert unowned == []
 
-    def test_teams_involved_includes_all_four_teams(self, full_network, ticket):
+    def test_teams_involved_includes_discovered_peers(self, full_network, ticket):
         finding = full_network.own_ticket(ticket)
         teams = {t.team for t in finding.teams_involved}
         assert {"mirrormaker", "group-coordinator", "kafka-broker",
-                "kafka-clients"} <= teams
+                "kafka-clients", "kafka-security"} <= teams
 
     def test_testing_strategy_aggregates_from_all_participants(self, full_network, ticket):
         finding = full_network.own_ticket(ticket)
@@ -215,6 +207,7 @@ class TestMirrorMakerOwnTicket:
         assert "group-coordinator" in joined
         assert "kafka-broker" in joined
         assert "kafka-clients" in joined
+        assert "kafka-security" in joined
 
     def test_requires_human_only_for_the_apache_vote(self, full_network, ticket):
         """The single legitimate escalation is the PMC vote, nothing else."""

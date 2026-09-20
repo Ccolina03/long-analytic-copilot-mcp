@@ -4,6 +4,7 @@ testpaths = [
     "agents/tests",
     "llm/tests",
     "router/tests",
+    "api/tests",
     "tests/integration",
 ]
 python_files  = ["test_*.py"]

@@ -28,12 +28,18 @@ them:
 - **Part IX** is a phased implementation plan with concrete unit and
   integration tests gating every step.
 
-One example is used consistently throughout: **the MirrorMaker team
+One example is used consistently throughout: the MirrorMaker team
 (cross-cluster async replication) has already identified that its consumer
 group discovery path is too slow and has a rough idea of the fix. It owns the
-ticket and drives the work, consulting the group coordinator team, the broker
-team, and the clients team directly along the way.** Concrete runbooks for
-these four agents live in [`runbooks/`](./runbooks/).
+ticket and drives the work. It does not start with a list of peers. After
+its own investigation it declares the *consequences* of the proposed change
+(group-state mutation, a wire-protocol field, broker heap, a new
+authorization surface). Discovery resolves those to teams. `kafka-security`
+is pulled in that way — nobody investigating a replication-latency bug
+would have named them. Teams whose concerns do not match (`kafka-storage`,
+`kafka-streams`, `kafka-connect`, `kafka-tools`) are skipped with a recorded
+reason. Runbooks in [`runbooks/`](./runbooks/) are **architecture and
+CODEOWNERS only** — they do not contain the solution to any ticket.
 
 Everything in this document targets **Apache Kafka 4.3** and real upstream
 module paths. There is no vendor-specific surface anywhere in the system.
@@ -269,8 +275,10 @@ detail that makes this a network of specialists rather than five copies
 of the same generalist with different system prompts. It's enforced in
 code, not just requested in a prompt.
 
-Here are the four agents that exist today. Each maps to a real Apache Kafka
-subsystem with a real module path; full detail is in each agent's runbook.
+Here are the agents in the org directory today. Five have an implemented
+SME; four exist so discovery can skip them on purpose. Full architecture
+and CODEOWNERS for each is in that team's runbook — the runbook is domain
+memory, not a playbook for the example ticket.
 
 ```
 mirrormaker          (MirrorMaker 2 — owns the example ticket below)
@@ -279,25 +287,45 @@ mirrormaker          (MirrorMaker 2 — owns the example ticket below)
       MirrorCheckpointConnector, MirrorCheckpointTask, OffsetSyncStore
     → see runbooks/mirrormaker-sme.md
 
-group-coordinator    (consumer groups — consulted for feasibility)
+group-coordinator    (consumer groups)
   owns:
     group-coordinator/src/main/java/org/apache/kafka/coordinator/group/
       GroupMetadataManager, GroupCoordinatorShard, OffsetMetadataManager
     → see runbooks/group-coordinator-sme.md
 
-kafka-broker         (request routing + KRaft — consulted for servability)
+kafka-broker         (request routing + KRaft)
   owns:
     core/src/main/scala/kafka/server/          KafkaApis, BrokerServer
     metadata/src/main/java/org/apache/kafka/   QuorumController, MetadataImage
     → see runbooks/kafka-broker-sme.md
 
-kafka-clients        (wire protocol + KIP process — consulted for the API surface)
+kafka-clients        (wire protocol + KIP process)
   owns:
     clients/src/main/resources/common/message/*.json
     clients/src/main/java/org/apache/kafka/clients/admin/
     the Apache Kafka KIP process itself
     → see runbooks/kafka-clients-sme.md
+
+kafka-security       (authorization + ACL semantics)  — discovered, not named
+  owns:
+    metadata/.../authorizer/   StandardAuthorizer
+    clients/.../common/acl/    AclOperation, ResourcePattern
+    → see runbooks/kafka-security-sme.md
+
+kafka-storage / kafka-streams / kafka-connect / kafka-tools
+  in the directory, no agent deployed. Discovery still evaluates them.
+  A matching concern surfaces as "must review, no agent" rather than a skip.
 ```
+
+**Peer discovery.** An owning agent begins a ticket knowing only its own
+domain. It must not carry a hardcoded peer list — that does not scale, and
+it pretends the MirrorMaker engineer already knows the security team needs
+to review a latency fix. After investigating, the agent emits
+`ImpactSignal`s tagged from a closed concern taxonomy
+(`agents/discovery.py`). The directory maps concerns to teams. Every team
+gets a `PeerDecision`, including the skips. Recording the skips is the
+proof that the agent considered a team and had a reason not to spend its
+time.
 
 **Why the broker is a separate agent rather than folded into the coordinator.**
 It is the only team that owns the fact that a group's coordinator shard is
@@ -638,10 +666,7 @@ a ticket.
 │  DATA LAYER                                                          │
 │                                                                      │
 │  Knowledge Graph (Postgres)   ← entities + edges, described in §7   │
-│  Log pipeline (Kafka → Delta) ← one input source that feeds         │
-│                                  depends_on edges into the graph     │
-│  GitHub / Jira / Slack ingestion ← another input source, feeding    │
-│                                     ownership and decision edges     │
+│  GitHub / CODEOWNERS ingest   ← ownership edges into the graph      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -812,12 +837,13 @@ a side effect of it. The rendered artifact from this exact run is checked in at
 and [`tests/integration/test_group_discovery_by_topic_e2e.py`](./tests/integration/test_group_discovery_by_topic_e2e.py)
 replays it as a regression guard.
 
-The full domain runbooks referenced above are:
+The full domain runbooks (architecture and CODEOWNERS, not ticket solutions):
 
 - [`runbooks/mirrormaker-sme.md`](./runbooks/mirrormaker-sme.md)
 - [`runbooks/group-coordinator-sme.md`](./runbooks/group-coordinator-sme.md)
 - [`runbooks/kafka-broker-sme.md`](./runbooks/kafka-broker-sme.md)
 - [`runbooks/kafka-clients-sme.md`](./runbooks/kafka-clients-sme.md)
+- [`runbooks/kafka-security-sme.md`](./runbooks/kafka-security-sme.md)
 
 ---
 
@@ -929,63 +955,19 @@ tickets.
 ## 14. Repository Layout
 
 ```
-log-analytics-copilot/
+sme-network/
 │
-├── proto/
-│   ├── logs.proto               # LogEvent + LogIngestionService (existing)
-│   └── sme_agents.proto         # Ticket, Finding, ImpactRequest/Response,
-│                                 # SMEAgent RPCs (§8) — no Orchestrator RPCs
-│
-├── knowledge-graph/
-│   ├── schema.sql                # entities + edges tables (§7)
-│   ├── ingest_github.py          # PRs, CODEOWNERS → ownership edges
-│   ├── ingest_traces.py          # trace_id co-occurrence → depends_on edges
-│   ├── ingest_ticket_outcomes.py # resolved tickets → must_approve edges
-│   └── query.py                  # owning_team() / depends_on() — called
-│                                  # directly by every agent, not a service
-│
-├── router/
-│   ├── main.py                   # thin FastAPI intake — reads the
-│   │                              # assigned team off a ticket and hands
-│   │                              # it to that agent, no reasoning at all
-│   └── Dockerfile
-│
-├── agents/
-│   ├── base_agent.py             # SMEAgentBase: the 3-layer context (§5),
-│   │                              # OwnTicket() workflow AND ConsultAbout()
-│   │                              # workflow, ownership self-validation (§6)
-│   ├── mirrormaker_agent.py
-│   ├── group_coordinator_agent.py
-│   ├── kafka_broker_agent.py
-│   ├── kafka_clients_agent.py
-│   ├── kafka_streams_agent.py    # future
-│   ├── kafka_connect_agent.py    # future
-│   └── Dockerfile
-│
-├── runbooks/                     # persistent Domain Memory per agent (§5)
-│   ├── mirrormaker-sme.md
-│   ├── group-coordinator-sme.md
-│   ├── kafka-broker-sme.md
-│   └── kafka-clients-sme.md
-│
-├── mcp-server/
-│   ├── main.py                   # FastAPI MCP tool server (existing)
-│   ├── tools.py                  # Tool implementations (existing)
-│   └── requirements.txt
-│
-├── log-pipeline/                 # ONE input source to the Knowledge Graph,
-│   ├── kafka_to_delta.py         # not the center of the architecture (§10)
-│   ├── build_service_graph.py    # trace_id → depends_on edges (feeds §7)
-│   └── ...
-│
-├── scripts/
-│   ├── kafka-smoke.sh
-│   ├── spark-smoke.sh
-│   └── produce-fake-logs.py
-│
-├── docker-compose.yml
+├── proto/sme_agents.py           # Ticket, Finding, ImpactRequest/Response
+├── knowledge_graph/              # ownership edges every agent queries
+├── router/                       # thin intake — team field, no reasoning
+├── agents/                       # SME agents, discovery, tracing
+├── api/                          # FastAPI the UI talks to
+├── web/                          # Next.js + Three.js agent floor
+├── runbooks/                     # architecture + CODEOWNERS per team
+├── llm/                          # cheapest-model router
+├── examples/                     # last rendered 1-pager
 ├── README.md
-└── ARCHITECTURE.md               ← this file
+└── ARCHITECTURE.md
 ```
 
 Note the absence of an `orchestrator/` directory. What used to be
@@ -997,18 +979,6 @@ deliberately dumb.
 
 ## 15. Data Schema
 
-### LogEvent (`proto/logs.proto`)
-
-| Field | Type | Notes |
-|---|---|---|
-| `timestamp` | string | ISO-8601 UTC |
-| `service` | string | Partition key in the Silver log table |
-| `level` | string | DEBUG / INFO / WARN / ERROR |
-| `message` | string | Free-form, tokenized for keyword search |
-| `trace_id` | string | Shared across services for one logical request — feeds `depends_on` edges into the Knowledge Graph |
-| `event_id` | string | Unique per log line, used for deduplication |
-| `host` | string | Originating host |
-
 ### Knowledge Graph tables (Postgres — see §7)
 
 | Table | Description |
@@ -1016,15 +986,7 @@ deliberately dumb.
 | `entities` | Services, repositories, codepaths, decisions, teams, and rules |
 | `edges` | Typed relationships between entities, each with supporting evidence and a confidence score |
 
-### Delta tables (log pipeline — one input source, see §10)
-
-| Table | Layer | Description |
-|---|---|---|
-| `bronze_logs` | Bronze | Raw JSON as ingested from Kafka, append-only |
-| `silver_logs` | Silver | Parsed and deduplicated on `(trace_id, event_id)`, partitioned by service |
-| `service_graph` | Gold | `(from_service, to_service, co_occurrences)` — feeds `depends_on` edges into the Knowledge Graph |
-
-### `Ticket` / `Finding` / `ImpactResponse` (`proto/sme_agents.proto`)
+### `Ticket` / `Finding` / `ImpactResponse` (`proto/sme_agents.py`)
 
 Every agent's `OwnTicket()` result and every `ConsultAbout()` response uses
 these same shapes (§8). Fields are additive — an agent only fills in what
@@ -1069,13 +1031,12 @@ directly from the new agent's declared `OWNS` list.
 
 ## 17. Build Roadmap
 
-### Phase 0 — Observability backbone (done)
-- [x] Kafka (KRaft mode) + Spark streaming, Bronze/Silver Delta tables
-- [x] MCP server with 5 tools (`query_logs`, `top_errors`, `search_keyword`,
-      `pipeline_status`, `optimize_table`)
-- [x] `proto/logs.proto` + `LogIngestionService`
-- [x] Four SME runbooks (`mirrormaker`, `group-coordinator`, `kafka-broker`,
-      `kafka-clients`)
+### Phase 0 — Domain memory (done)
+- [x] SME runbooks as architecture + CODEOWNERS (`mirrormaker`,
+      `group-coordinator`, `kafka-broker`, `kafka-clients`, `kafka-security`,
+      plus directory entries for storage/streams/connect/tools)
+- [x] Peer discovery from impact signals, not hardcoded peer lists
+- [x] Next.js + Three.js floor that replays the deliberation
 
 ### Phase 1 — Knowledge Graph + typed protocol (Weeks 1–2)
 - [ ] `knowledge-graph/schema.sql` — entities + edges (§7)
@@ -1172,15 +1133,12 @@ Tool calls are simple request-response calls against the MCP server,
 which is already HTTP-native and discoverable through its manifest
 endpoint. These are genuinely different kinds of communication.
 
-**Why is the log pipeline treated as one peripheral input, not the
-center of the system?**
-An earlier version of this project treated the Kafka/Spark/Delta log
-pipeline as the core architecture. It's genuinely useful — shared
-`trace_id`s across services are one legitimate source of `depends_on`
-edges — but it is one ingestion pipeline among several (GitHub, Jira,
-Slack, static analysis). The Knowledge Graph (§7) and the typed agent
-protocol (§8) are the actual product; log ingestion is plumbing that feeds
-one kind of evidence into it.
+**Why is there no log pipeline in this repo?**
+An earlier prototype ingested Kafka/Spark/Delta traces. The product is
+the SME network: ownership boundaries, peer discovery, and a 1-pager.
+The Knowledge Graph (§7) and the typed agent protocol (§8) are the
+center; CODEOWNERS and runbooks are enough ownership evidence for the
+demo.
 
 **Why not start with autonomous code changes?**
 Because the hypothesis in §4 — that specialized agents with ownership
@@ -1278,12 +1236,8 @@ in §6.
 - `test_co_occurrence_row_produces_depends_on_edge_with_matching_weight`
 - `test_self_referential_rows_are_excluded`
 
-**Integration tests** (reuse `scripts/produce-fake-logs.py`):
-- `test_end_to_end_from_synthetic_logs_produces_expected_edge_count`
-
-**Definition of done:** the integration test is green, and running the
-ingestor against the real Delta data already on disk produces at least
-one `depends_on` edge verifiable by eye in the raw logs.
+**Status:** dropped from this repo. Ownership comes from CODEOWNERS and
+runbooks, not a Spark/Delta log pipeline.
 
 ### 20.4 Slice: Graph Query Library
 

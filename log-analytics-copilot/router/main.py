@@ -42,6 +42,8 @@ _DEFAULT_ADDRESSES: dict[str, str] = {
         "AGENT_ADDR_KAFKA_CLIENTS", "http://kafka-clients-agent:8003"),
     "kafka-broker": os.environ.get(
         "AGENT_ADDR_KAFKA_BROKER", "http://kafka-broker-agent:8004"),
+    "kafka-security": os.environ.get(
+        "AGENT_ADDR_KAFKA_SECURITY", "http://kafka-security-agent:8005"),
 }
 
 # Mutable reference so tests can swap it without restarting the app

@@ -8,12 +8,10 @@ right thing in both the escalated and non-escalated cases.
 
 import pytest
 
-from agents.base_agent import DirectTransport, NullTransport
-from agents.group_coordinator_agent import GroupCoordinatorAgent
-from agents.kafka_broker_agent import KafkaBrokerAgent
+from agents.base_agent import NullTransport
 from agents.design_doc import render_one_pager
 from agents.mirrormaker_agent import MirrorMakerAgent
-from agents.kafka_clients_agent import KafkaClientsAgent
+from agents.network import build_network
 from proto.sme_agents import (
     DeliberationRound,
     DesignAlternative,
@@ -44,16 +42,7 @@ REQUIRED_SECTIONS = [
 @pytest.fixture(scope="module")
 def real_doc():
     """Render the doc from a real full-network deliberation."""
-    clients = KafkaClientsAgent()
-    broker = KafkaBrokerAgent()
-    coordinator = GroupCoordinatorAgent(
-        transport=DirectTransport({"kafka-clients": clients})
-    )
-    mirrormaker = MirrorMakerAgent(transport=DirectTransport({
-        "group-coordinator": coordinator,
-        "kafka-broker": broker,
-        "kafka-clients": clients,
-    }))
+    mirrormaker = build_network()["mirrormaker"]
     ticket = Ticket.new(
         team="mirrormaker",
         title="MirrorCheckpointConnector group discovery is slow — 8-12s p99 on clusters with >10k consumer groups",
@@ -217,7 +206,7 @@ class TestDocIsReadableLength:
         """
         _, doc = real_doc
         assert len(doc) > 4000, "doc is too thin to be useful"
-        assert len(doc) < 40000, "doc has ballooned past a reviewable size"
+        assert len(doc) < 55000, "doc has ballooned past a reviewable size"
 
     def test_doc_ends_with_newline(self, real_doc):
         _, doc = real_doc

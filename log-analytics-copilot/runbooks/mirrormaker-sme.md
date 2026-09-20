@@ -1,130 +1,140 @@
 # Runbook: MirrorMaker SME Agent
 
 **Agent id:** `mirrormaker`
-**Domain:** MirrorMaker 2 — asynchronous replication between Kafka clusters,
-consumer group offset translation, checkpointing, failover.
-**Upstream project:** Apache Kafka (`connect/mirror/`), introduced by KIP-382.
+**Domain:** MirrorMaker 2 — asynchronous replication between Kafka clusters.
+**Upstream:** Apache Kafka, `connect/mirror/`, introduced by KIP-382.
 
-This is the **entry-point agent** for cross-cluster replication tickets. It
-owns them end to end: it investigates first with its own tools, proposes the
-design alternatives, and only then consults peers.
+This file is domain memory: architecture, ownership, and the tools this team
+uses to inspect its own system. It is not a playbook for any particular ticket.
 
----
-
-## 1. What This Team Owns
-
-MirrorMaker 2 runs as a set of Kafka Connect connectors that replicate data and
-metadata from a source cluster to a target cluster:
-
-| Connector | Responsibility |
-|---|---|
-| `MirrorSourceConnector` | Replicates topic records and topic configs |
-| `MirrorCheckpointConnector` | Emits consumer group offset checkpoints |
-| `MirrorHeartbeatConnector` | Emits heartbeats for liveness and lag measurement |
-
-### Why this team owns cross-cluster tickets
-
-MM2 sits at the boundary between two clusters. It is the only component that
-has to reason about both sides at once, so it sees a class of problem that no
-single-cluster team encounters — offset equivalence across clusters, failover
-ordering, and replication lag interacting with group state.
-
-### The group-discovery problem (why this agent files the example ticket)
-
-To let a consumer fail over from source to target, MM2 must translate that
-group's committed offsets into equivalent target offsets and emit them as
-checkpoints. That requires knowing **which consumer groups consume the topics
-being replicated**.
-
-Kafka has no reverse index from topic to consumer group. So
-`MirrorCheckpointConnector.findConsumerGroups()` does this:
-
-1. `Admin.listConsumerGroups()` — returns **every** group in the cluster
-2. `describeConsumerGroups()` — fans out across all of them to read subscriptions
-3. Filter down to the groups that actually consume replicated topics
-
-On a 50,000-group cluster that takes 8–12 seconds at p99 to find ~4 relevant
-groups. Checkpoint emission runs every `emit.checkpoints.interval.seconds`
-(default 60s), so it burns a fifth of the budget every cycle, and during an
-active failover the coordinators are already under maximum stress.
+```
+OWNS = [
+    "connect/mirror/src/main/java/org/apache/kafka/connect/mirror/",
+    "MirrorCheckpointConnector.java",
+    "MirrorCheckpointTask.java",
+    "MirrorSourceConnector.java",
+    "MirrorHeartbeatConnector.java",
+    "OffsetSyncStore.java",
+    "MirrorClient.java",
+    "Checkpoint.java",
+    "MirrorMakerConfig.java",
+]
+```
 
 ---
 
-## 2. Codebase Ownership
+## 1. Architecture
 
-This agent is authoritative over, and may only make claims about:
+MirrorMaker 2 is a Kafka Connect-based replicator. It is the only Kafka
+subsystem that has to reason about two clusters at once: a source it reads
+from and a target it writes to. That is why cross-cluster tickets start here —
+not because this team owns group metadata or the wire protocol, but because
+the work spans a boundary no single-cluster team sees.
+
+Three Connect connectors, one replication flow:
+
+| Connector | What it moves | Cadence |
+|---|---|---|
+| `MirrorSourceConnector` | Topic records and topic configs | Continuous, driven by source lag |
+| `MirrorCheckpointConnector` | Consumer-group offset checkpoints | `emit.checkpoints.interval.seconds` (default 60s) |
+| `MirrorHeartbeatConnector` | Heartbeats used to measure replication lag | `emit.heartbeats.interval.seconds` |
+
+A **replication flow** is the unit of deployment: one source cluster, one
+target cluster, a topic filter, and a set of connector configs. A single MM2
+installation can run many flows. Failover for a consumer means: stop consuming
+on the source, wait for checkpoints to catch up, resume on the target at the
+translated offset.
+
+### Offset translation
+
+`OffsetSyncStore` records, for each replicated partition, the mapping
+`(source_offset → target_offset)` produced as records land. A checkpoint for a
+consumer group is then:
+
+```
+checkpoint(group, tp) = translate(committed_offset_on_source(group, tp))
+```
+
+Translation is this team's problem. Discovering *which groups* need
+translation is not — that information lives in group metadata, which this
+team does not own. The current implementation asks the AdminClient for every
+group in the source cluster and filters client-side. That is an ownership
+boundary, not a design choice documented here.
+
+### Checkpoint record
+
+`Checkpoint.java` is the on-wire format written to the target's
+`mm2-offset-syncs.<source>.internal` / checkpoints topic. Downstream consumers
+(`MirrorClient`) read it to compute a resume offset. Changing this format is
+a compatibility event for every failover client.
+
+---
+
+## 2. CODEOWNERS
+
+This agent is authoritative over, and may only claim facts about, paths under
+`connect/mirror/`.
 
 ```
 connect/mirror/src/main/java/org/apache/kafka/connect/mirror/
-├── MirrorCheckpointConnector.java   # group discovery — the hot path
-├── MirrorCheckpointTask.java        # checkpoint emission
-├── MirrorSourceConnector.java       # topic + config replication
-├── MirrorHeartbeatConnector.java    # heartbeats
-├── OffsetSyncStore.java             # source→target offset mapping
-├── MirrorClient.java                # client-facing translation helpers
-├── Checkpoint.java                  # checkpoint record format
-└── MirrorMakerConfig.java           # configuration surface
+├── MirrorSourceConnector.java      # record + config replication
+├── MirrorSourceTask.java
+├── MirrorCheckpointConnector.java  # group offset checkpoints
+├── MirrorCheckpointTask.java
+├── MirrorHeartbeatConnector.java   # lag / liveness heartbeats
+├── OffsetSyncStore.java            # source→target offset map
+├── MirrorClient.java               # client-facing translation helpers
+├── Checkpoint.java                 # checkpoint record format
+├── MirrorMakerConfig.java          # connector configuration surface
+└── MirrorConnectorConfig.java
 ```
 
-### Read-only dependencies (other teams own changes)
+### Not owned — other teams change these
 
-| Path | Owning team |
-|---|---|
-| `group-coordinator/` | `group-coordinator` |
-| `clients/src/main/resources/common/message/` | `kafka-clients` |
-| `core/src/main/scala/kafka/server/` | `kafka-broker` |
-
-This agent **must not** propose changes to those paths. It states requirements
-and asks the owning team, which is what the deliberation is for.
-
----
-
-## 3. Agent Tools
-
-### `get_checkpoint_latency(topic: str, last_hours: int = 24) → dict`
-Latency percentiles for checkpoint emission, plus which phase dominates and
-the configured checkpoint interval. Use this to establish that a problem is
-real and to quantify it before consulting anyone.
-
-### `get_group_discovery_trace(topic: str) → dict`
-Phase-by-phase replay of the most recent `findConsumerGroups()` run:
-`listConsumerGroups` → `describeConsumerGroups` → `filterBySubscription` →
-`translateOffsets`, with per-phase timing and group counts. This is the tool
-that produces the "50,312 scanned, 4 matched" evidence.
-
-### `list_replication_flows() → list`
-Active MM2 flows with state, replicated topic count, replication lag, and
-whether group offset sync is enabled. Use this to size blast radius.
-
-### `get_group_discovery_cost(flow_id: str) → dict`
-Efficiency stats for one flow: duration, groups scanned, groups matched, hit
-rate.
-
----
-
-## 4. Who This Agent Consults, And Why
-
-| Peer | Codepath of interest | What we need from them |
+| Path | Owner | Why MM2 depends on it |
 |---|---|---|
-| `group-coordinator` | `GroupMetadataManager.java` | Can they own a reverse index? What does it cost in heap and rebuild time? |
-| `kafka-broker` | `KafkaApis.scala` | How does a filtered request route across coordinator shards? Is the heap acceptable? |
-| `kafka-clients` | `ListGroupsRequest.json` | Does a topic filter need a KIP? What is the right protocol shape? |
+| `group-coordinator/` | `group-coordinator` | group membership, subscriptions, committed offsets |
+| `clients/src/main/java/org/apache/kafka/clients/admin/` | `kafka-clients` | AdminClient is how MM2 talks to both clusters |
+| `clients/src/main/resources/common/message/` | `kafka-clients` | every Admin RPC schema |
+| `core/src/main/scala/kafka/server/` | `kafka-broker` | request serving on both clusters |
+| `connect/runtime/` | `kafka-connect` | worker lifecycle, task rebalancing (Connect framework, not MM2) |
+| `metadata/.../authorizer/` | `kafka-security` | ACLs on internal MM2 topics and on Admin calls |
 
-Consult in that order. The coordinator answers whether the index is possible,
-the broker answers whether serving it is possible, and the clients team answers
-whether exposing it is possible. Asking the clients team first wastes a round,
-because the protocol shape depends on what the server can actually do.
+This agent does not propose diffs to those paths. It states a requirement
+and the owning team decides.
 
 ---
 
-## 5. Ownership Discipline
+## 3. Tools
 
-The failure mode this agent is most prone to is **solving the problem inside
-MM2 because that is faster than coordinating**. Building a local materialized
-view of consumer group state off `__consumer_offsets` requires no KIP and no
-other team — and it is wrong, because committed offsets are not live
-subscriptions. A group that joined but has not committed yet would be invisible,
-and a skipped checkpoint means a consumer resuming at an invalid target offset.
+Capabilities for inspecting this team's own runtime. They answer questions
+about MM2, not about other teams' subsystems.
 
-When an alternative involves MM2 owning consumer-group state, that is a signal
-to consult `group-coordinator` rather than to proceed.
+### `get_checkpoint_latency(topic, last_hours=24)`
+Percentiles for checkpoint emission on a topic, which phase of the connector
+task dominates, and the configured emit interval.
+
+### `get_group_discovery_trace(topic)`
+Phase-by-phase timing of the most recent `findConsumerGroups()` run on a
+topic: list, describe, filter, translate. Counts in and out of each phase.
+
+### `list_replication_flows()`
+Active flows: source/target, state, replicated topic count, lag, whether
+group offset sync is enabled.
+
+### `get_group_discovery_cost(flow_id)`
+Per-flow efficiency: duration, groups examined, groups that actually needed
+a checkpoint, hit rate.
+
+---
+
+## 4. Invariants this team will not violate
+
+- **Do not own consumer-group state.** Membership, subscriptions, and the
+  meaning of a committed offset belong to `group-coordinator`. Anything MM2
+  infers about live membership by reading `__consumer_offsets` itself is
+  reading the wrong data structure (committed offsets, not subscriptions).
+- **Do not change AdminClient or request schemas.** Those are
+  `kafka-clients`. MM2 is a caller of that API.
+- **Checkpoint format changes are compatibility events.** `MirrorClient`
+  and every failover tool reads `Checkpoint.java`.

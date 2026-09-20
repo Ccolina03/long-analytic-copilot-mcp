@@ -1,134 +1,148 @@
 # Runbook: Kafka Broker SME Agent
 
 **Agent id:** `kafka-broker`
-**Domain:** Broker request handling (`KafkaApis`), the KRaft controller and
-metadata log, broker heap and GC budget.
-**Upstream project:** Apache Kafka (`core/` and `metadata/` modules).
+**Domain:** Broker request handling, KRaft metadata, broker heap and GC.
+**Upstream:** Apache Kafka, `core/` (Scala server) and `metadata/` (KRaft).
+
+This file is domain memory: architecture, ownership, and the tools this team
+uses to inspect its own system. It is not a playbook for any particular ticket.
+
+```
+OWNS = [
+    "core/src/main/scala/kafka/server/",
+    "KafkaApis.scala",
+    "BrokerServer.scala",
+    "KafkaConfig.scala",
+    "metadata/src/main/java/org/apache/kafka/controller/",
+    "QuorumController.java",
+    "MetadataImage.java",
+]
+```
 
 ---
 
-## 1. Why This Agent Exists
+## 1. Architecture
 
-The other three teams can agree on a perfect design and still ship something
-that does not work, because none of them owns the fact that makes topic-scoped
-group queries awkward:
+A Kafka broker is a request server plus a replica. This team owns the request
+server: how an RPC is dispatched, which other brokers must be contacted to
+answer it, what is legal to store in cluster metadata, and the heap budget
+everything on the broker competes for.
 
-> A group's coordinator shard is `abs(group_id.hashCode()) % 50`. That has
-> nothing to do with which topics the group consumes. So the groups consuming a
-> single topic are spread across **every** `__consumer_offsets` shard.
+### Request dispatch
 
-A filtered `ListGroups` therefore **cannot** be a single targeted lookup. It
-must still fan out to all 50 coordinator shards, because the broker has no way
-to know which shards hold a match without asking them.
+`KafkaApis.scala` is the single dispatch table. Every client RPC lands here
+first. Some requests are answered locally (Produce to a leader replica this
+broker holds, Fetch, Metadata). Some are forwarded (a Produce to a partition
+this broker does not lead). Some **fan out** to other brokers and the results
+are unioned before the response is written back.
 
-This does not invalidate the reverse index — the index changes each shard's work
-from a full metadata walk to a hash lookup, which is where the win comes from —
-but a design doc that describes it as "one indexed lookup instead of a scan" is
-wrong in a way that will mislead whoever implements it. Correcting that framing
-is this agent's most important contribution.
+Fan-out is a property of the *request*, not of the caller. `ListGroups` is
+the standing example: a group's coordinator shard is
+
+```
+abs(group_id.hashCode()) % __consumer_offsets.partitions
+```
+
+which is independent of the topics that group consumes. Any `ListGroups` —
+filtered or not — is therefore a scatter-gather across every coordinator
+shard. This team owns that dispatch. `group-coordinator` owns what each
+shard does with the request once it arrives.
+
+Per-shard errors on a fan-out must be visible in the response. A silently
+truncated union is a correctness bug for every caller.
+
+### KRaft metadata
+
+Since Kafka 3.3 / 4.0, cluster metadata lives in the `__cluster_metadata`
+log, maintained by `QuorumController` and materialized on every broker as
+`MetadataImage`. The log's design intent is **cluster topology that changes
+rarely**:
+
+- topics, partitions, replica assignments
+- broker registrations
+- ACLs and SCRAM credentials
+- configs
+
+It is replicated to every broker and replayed on startup. Snapshot size and
+startup time grow with the log. Anything that churns at consumer-group
+rebalance frequency (~orders of magnitude above topology changes) does not
+belong here. Group membership in particular is `group-coordinator` state,
+persisted in `__consumer_offsets`, and must stay there.
+
+### Heap
+
+The broker JVM is a shared budget. The large consumers, in typical order:
+
+1. log index / page-cache metadata
+2. replica fetcher buffers
+3. group metadata (`group-coordinator`, resident on coordinator shards)
+4. `MetadataImage`
+
+Any new in-memory structure this team is asked to host is evaluated as a
+percentage of total heap and against G1 pause p99, not as an absolute
+megabyte number. Unbounded maps require a config cap and a documented
+degraded path.
 
 ---
 
-## 2. Codebase Ownership
+## 2. CODEOWNERS
 
 ```
 core/src/main/scala/kafka/server/
-├── KafkaApis.scala          # request dispatch, including ListGroups fan-out
-├── BrokerServer.scala       # broker lifecycle
-└── KafkaConfig.scala        # broker configuration surface
+├── KafkaApis.scala       # RPC dispatch, including fan-out
+├── BrokerServer.scala    # broker lifecycle
+├── KafkaConfig.scala     # broker configuration surface
+└── ReplicaManager.scala  # (read-mostly from this agent's point of view)
 
 metadata/src/main/java/org/apache/kafka/
-├── controller/QuorumController.java   # KRaft controller
-└── image/MetadataImage.java           # in-memory metadata snapshot
+├── controller/QuorumController.java
+└── image/MetadataImage.java
 ```
 
-### Read-only dependencies
+### Not owned — other teams change these
 
-| Path | Owning team |
-|---|---|
-| `group-coordinator/` | `group-coordinator` |
-| `clients/src/main/resources/common/message/` | `kafka-clients` |
+| Path | Owner | Boundary |
+|---|---|---|
+| `group-coordinator/` | `group-coordinator` | what a coordinator shard *does*; this team routes *to* it |
+| `clients/src/main/resources/common/message/` | `kafka-clients` | request schema; this team owns the handler |
+| `clients/src/main/java/org/apache/kafka/clients/` | `kafka-clients` | client-side FindCoordinator / AdminClient |
+| `storage/` | `kafka-storage` | log segments, retention, compaction |
+| `metadata/.../authorizer/` | `kafka-security` | Authorizer is invoked from KafkaApis but owned there |
 
-This agent owns the request *handler*; `kafka-clients` owns the request
-*schema*. Both have to agree for a protocol change to be servable.
-
----
-
-## 3. Agent Tools
-
-### `get_request_routing(api_name: str) → dict`
-How a request is dispatched: handler method, routing strategy, shard count, and
-*why* it routes that way. For `ListGroups` this returns
-`fan_out_all_coordinator_shards` with the group-id-hash explanation. This is the
-tool that produces the correction in §1.
-
-### `get_coordinator_distribution(topic: str) → dict`
-How groups consuming a topic spread across shards. Returns matched groups,
-shards actually holding a match, and shards that must be queried anyway. The
-gap between those last two numbers is the structural cost of the fan-out.
-
-### `get_broker_heap_profile(broker_id: int) → dict`
-Heap total, used, headroom, GC collector, GC pause p99, and the largest
-consumers by component. Use this before signing off on any new in-memory
-structure — state the cost as a percentage of total heap, not as an absolute.
-
-### `get_kraft_metadata_budget() → dict`
-Metadata log size, steady-state record rate, snapshot interval, the log's
-**design intent**, and measured consumer group churn. Use this to evaluate any
-proposal to put state in `__cluster_metadata`.
+A protocol change needs both this team (can the handler serve it, at what
+cost) and `kafka-clients` (is the schema legal). Neither can ship it alone.
 
 ---
 
-## 4. Standing Positions
+## 3. Tools
 
-Two proposals recur and both should be rejected. Knowing why in advance saves a
-deliberation round.
+### `get_request_routing(api_name)`
+How `api_name` is dispatched: handler, routing strategy (local / forward /
+fan-out), shard count, and the reason it routes that way.
 
-### Do not put consumer group state in the KRaft metadata log
+### `get_coordinator_distribution(topic)`
+How groups consuming a topic sit across coordinator shards: groups matched,
+shards that actually hold a match, shards that must be queried to find them.
 
-The metadata log carries cluster topology — topics, partitions, broker
-registrations, ACLs — which changes rarely, is replicated to every broker, and
-is replayed at startup.
+### `get_broker_heap_profile(broker_id)`
+Heap total / used / headroom, GC collector, pause p99, largest consumers by
+component.
 
-Measured group membership churn is roughly **32x** the log's steady-state record
-rate. Putting subscriptions there would dominate the log, grow snapshots without
-bound, slow startup for every broker in the cluster, and — worst — make
-rebalancing depend on controller availability, which it does not today. That is
-an availability regression dressed up as an optimization.
-
-### Do not re-hash group→shard placement to co-locate by topic
-
-The `abs(group_id.hashCode()) % 50` formula is a de facto public contract. Every
-client library computes it to find a coordinator via `FindCoordinator`, and
-existing `__consumer_offsets` data is already laid out by it. There is no
-migration path. It would also concentrate a popular topic's groups onto one
-shard, creating a hotspot worse than the problem being solved.
+### `get_kraft_metadata_budget()`
+Metadata log size, steady-state record rate, snapshot interval, design
+intent, and measured consumer-group churn for comparison.
 
 ---
 
-## 5. Partial Results Are A Protocol Concern
+## 4. Invariants this team will not violate
 
-With a 50-way fan-out, some shard will occasionally be unavailable. A response
-must distinguish:
-
-- "these are all the matching groups", from
-- "these are the matching groups we could reach"
-
-That distinction belongs in the protocol, not in an implementation note. A
-caller like MM2 checkpointing against a silently truncated group set is exactly
-the correctness failure the work is meant to prevent. Insist this is specified in
-the KIP.
-
----
-
-## 6. Ownership Discipline
-
-This agent's job in a deliberation is to be the one who says "that will not work
-the way you think", with numbers. Its tools exist to make those objections
-quantitative rather than instinctive — a heap objection should cite headroom and
-percentage, a metadata objection should cite the churn ratio, and a routing
-objection should cite the shard count.
-
-Sign-off from this agent means the design is servable by the broker at the stated
-latency and within the stated heap budget. Do not give it on the basis of a
-design that has not addressed the fan-out.
+- **Group→shard placement stays `hash(group_id)`.** Re-hashing by subscribed
+  topic is not migratable (client `FindCoordinator`, existing
+  `__consumer_offsets` layout) and creates per-topic hotspots.
+- **Group state does not go in `__cluster_metadata`.** Topology log, rare
+  changes, replayed everywhere. Group churn would dominate it and would
+  couple rebalance to controller availability.
+- **Fan-out responses carry per-shard errors.** Callers must be able to tell
+  a complete result from a partial one.
+- **New heap is capped.** A map that grows with cluster size ships with a
+  config bound and a fallback, or it does not ship.

@@ -24,11 +24,25 @@ Core workflows
       Full workflow for a ticket this agent's team owns.
       1. Investigate using own tools.
       2. Propose 3 design alternatives.
-      3. Look up affected teams (Knowledge Graph).
+      3. **Discover** which teams are affected — see below.
       4. Deliberate with peers for up to MAX_DELIBERATION_ROUNDS rounds,
          refining the alternatives each round until convergence.
       5. Assemble the final Finding as a 1-page design doc, deciding
          requires_human once, here.
+
+Peer discovery
+--------------
+An agent begins a ticket knowing only its own domain — it has no list of
+peers. After investigating, it declares the **consequences** of the change it
+is proposing as ``ImpactSignal`` records ("this mutates consumer group state",
+"this lets a caller infer which groups consume a topic"), and
+``agents.discovery`` resolves those consequences to the teams authoritative on
+them. Teams whose concerns do not intersect the signals are skipped, and the
+skip reason is recorded. See ``agents/discovery.py``.
+
+Subclasses implement discovery by overriding ``_impact_signals()``. The older
+``_select_peers()`` hook still works as a fallback for agents that name peers
+directly, but new agents should declare signals instead.
 
   ``consult_about(request, depth=0)``
       Workflow used when another agent consults this one.
@@ -59,17 +73,34 @@ from typing import TYPE_CHECKING, Any, Callable
 if TYPE_CHECKING:
     from llm.client import AgentLLM
 
+from agents.discovery import DiscoveryResult, discover_peers
+from agents.trace import NullTracer, Tracer
 from proto.sme_agents import (
     DeliberationRound,
     DesignAlternative,
     Finding,
     ImpactRequest,
     ImpactResponse,
+    ImpactSignal,
+    PeerDecision,
     TeamInvolvement,
     Ticket,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _brief(value: dict[str, Any], limit: int = 4) -> str:
+    """One-line human summary of a tool result, for the trace timeline."""
+    parts = []
+    for key, val in list(value.items())[:limit]:
+        if isinstance(val, (list, dict)):
+            parts.append(f"{key}={len(val)} item{'s' if len(val) != 1 else ''}")
+        else:
+            parts.append(f"{key}={val}")
+    if len(value) > limit:
+        parts.append(f"+{len(value) - limit} more")
+    return ", ".join(parts)
 
 
 # ---------------------------------------------------------------------------
@@ -197,7 +228,7 @@ class SMEAgentBase:
     Subclasses should override:
         _investigate(ticket)
         _propose_alternatives(ticket, investigation)   → must return 3
-        _select_peers(ticket, investigation)
+        _impact_signals(ticket, investigation)         → drives peer discovery
         _handle_consultation(request, depth)
         _build_background/_build_goals/_build_non_goals/...
     """
@@ -223,6 +254,7 @@ class SMEAgentBase:
         transport: PeerTransport | None = None,
         kg_conn: Any = None,
         llm: "AgentLLM | None" = None,
+        tracer: Tracer | None = None,
     ):
         """
         Args:
@@ -234,11 +266,32 @@ class SMEAgentBase:
                         from the environment; if nothing is configured it
                         resolves to "no model" and every agent falls back to
                         its deterministic authored content at zero cost.
+            tracer:     Optional shared timeline for the UI.  Defaults to a
+                        NullTracer, which discards events, so behaviour is
+                        identical whether or not anybody is watching.
         """
         self._transport = transport or NullTransport()
         self._kg_conn = kg_conn
         self._llm = llm
         self._llm_initialized = llm is not None
+        self._tracer: Tracer = tracer or NullTracer()
+
+    # ------------------------------------------------------------------
+    # Tracing
+    # ------------------------------------------------------------------
+
+    def attach_tracer(self, tracer: Tracer) -> None:
+        """Route this agent's events into a shared timeline.
+
+        Every agent in a network must be given the *same* instance, otherwise
+        a peer's reasoning lands in a timeline nobody reads.  Use
+        ``agents.trace.attach_tracer`` to do this for a whole network.
+        """
+        self._tracer = tracer
+
+    @property
+    def tracer(self) -> Tracer:
+        return self._tracer
 
     # ------------------------------------------------------------------
     # LLM access
@@ -346,9 +399,17 @@ class SMEAgentBase:
         ``requires_human`` once at the very end.
         """
         logger.info("[%s] OwnTicket: %s (%s)", self.AGENT_NAME, ticket.ticket_id, ticket.title)
+        self._tracer.emit(
+            phase="intake", agent=self.AGENT_NAME, kind="ticket",
+            title=f"{ticket.ticket_id} assigned to {self.AGENT_NAME}",
+            detail=ticket.title,
+            priority=ticket.priority, source=ticket.source,
+            source_url=ticket.source_url, domain=self.DOMAIN,
+        )
 
         # Step 1 — investigate with own tools
         investigation = self._investigate(ticket)
+        self._trace_investigation(investigation)
 
         # Step 2 — propose the initial solution space (always 3 alternatives)
         alternatives = self._propose_alternatives(ticket, investigation)
@@ -357,9 +418,18 @@ class SMEAgentBase:
             "[%s] proposed %d alternatives: %s",
             self.AGENT_NAME, len(alternatives), [a.name for a in alternatives],
         )
+        for alt in alternatives:
+            self._tracer.emit(
+                phase="alternatives", agent=self.AGENT_NAME, kind="alternative",
+                title=f"{alt.label}. {alt.name}",
+                detail=alt.approach,
+                label=alt.label, effort=alt.effort, risk=alt.risk,
+                pros=alt.pros, cons=alt.cons, blast_radius=alt.blast_radius,
+            )
 
-        # Step 3 — who is affected
-        peers = self._select_peers(ticket, investigation)
+        # Step 3 — discover who is affected, from the consequences of the change
+        discovery = self._discover_peers(ticket, investigation)
+        peers = discovery.peers()
         logger.info("[%s] peers to deliberate with: %s", self.AGENT_NAME, [p for p, _ in peers])
 
         # Step 4 — deliberate for up to MAX_DELIBERATION_ROUNDS
@@ -380,12 +450,52 @@ class SMEAgentBase:
                     round_number=round_num,
                     prior_concerns=sorted(seen_concerns),
                 )
+                self._tracer.emit(
+                    phase="deliberation", agent=self.AGENT_NAME, kind="request",
+                    to_agent=peer_id, round_number=round_num,
+                    title=f"asks {peer_id}",
+                    detail=request.question,
+                    codepaths=request.codepaths_of_interest,
+                    request_type=request.request_type,
+                    alternatives_on_table=[a.label for a in alternatives],
+                    prior_concerns=sorted(seen_concerns),
+                )
+
                 response = self._transport.consult(peer_id, request)
                 round_responses.append(response)
                 all_responses.append(response)
 
                 new_here = [c for c in response.new_concerns if c not in seen_concerns]
                 seen_concerns.update(response.new_concerns)
+
+                self._tracer.emit(
+                    phase="deliberation", agent=peer_id, kind="response",
+                    to_agent=self.AGENT_NAME, round_number=round_num,
+                    title=f"{peer_id}: {response.verdict}",
+                    detail=response.principal_review or response.summary,
+                    verdict=response.verdict,
+                    summary=response.summary,
+                    confidence=response.confidence,
+                    recommendation=response.recommendation,
+                    cited_codepaths=response.cited_codepaths,
+                    alternatives=[
+                        {"label": a.label, "name": a.name, "effort": a.effort,
+                         "risk": a.risk, "approach": a.approach,
+                         "pros": a.pros, "cons": a.cons,
+                         "rejected_reason": a.rejected_reason}
+                        for a in response.design_alternatives
+                    ],
+                    test_requirements=response.test_requirements,
+                    needs_org_authority=response.needs_org_authority,
+                    org_authority_reason=response.org_authority_reason,
+                    timed_out=response.timed_out,
+                )
+                for concern in new_here:
+                    self._tracer.emit(
+                        phase="deliberation", agent=peer_id, kind="concern",
+                        to_agent=self.AGENT_NAME, round_number=round_num,
+                        title="new concern", detail=concern,
+                    )
 
                 deliberation.append(DeliberationRound(
                     round_number=round_num,
@@ -405,7 +515,22 @@ class SMEAgentBase:
                 )
 
             # Fold peer feedback into the alternative set
+            before = {a.label: (a.recommended, a.rejected_reason) for a in alternatives}
             alternatives = self._refine_alternatives(alternatives, round_responses, round_num)
+            for alt in alternatives:
+                if before.get(alt.label) != (alt.recommended, alt.rejected_reason):
+                    self._tracer.emit(
+                        phase="synthesis", agent=self.AGENT_NAME, kind="alternative",
+                        round_number=round_num,
+                        title=(
+                            f"{alt.label}. {alt.name} — "
+                            + ("recommended" if alt.recommended else "ruled out")
+                        ),
+                        detail=alt.rejected_reason or alt.approach,
+                        label=alt.label, recommended=alt.recommended,
+                        rejected_reason=alt.rejected_reason,
+                        reviewed_by=alt.reviewed_by,
+                    )
 
             # Have we converged?
             if self._has_converged(round_responses):
@@ -415,18 +540,170 @@ class SMEAgentBase:
                 logger.info(
                     "[%s] deliberation converged after round %d", self.AGENT_NAME, round_num
                 )
+                self._tracer.emit(
+                    phase="decision", agent=self.AGENT_NAME, kind="convergence",
+                    round_number=round_num,
+                    title=f"converged after round {round_num}",
+                    detail=(
+                        "Every consulted team returned 'agreed' and raised no new "
+                        "concern this round."
+                    ),
+                    rounds_used=round_num, converged=True,
+                )
                 break
+        else:
+            if peers:
+                self._tracer.emit(
+                    phase="decision", agent=self.AGENT_NAME, kind="convergence",
+                    round_number=rounds_used,
+                    title=f"did not converge in {self.MAX_DELIBERATION_ROUNDS} rounds",
+                    detail="Unresolved disagreement goes to a human to break the tie.",
+                    rounds_used=rounds_used, converged=False,
+                )
 
         # Step 5 — assemble the design doc; requires_human decided ONLY here
         finding = self._assemble_finding(
             ticket, investigation, all_responses, alternatives,
             deliberation=deliberation, rounds_used=rounds_used, converged=converged,
+            discovery=discovery,
         )
+        self._trace_finding(finding)
         logger.info(
             "[%s] OwnTicket complete: rounds=%d converged=%s requires_human=%s",
             self.AGENT_NAME, finding.rounds_used, finding.converged, finding.requires_human,
         )
         return finding
+
+    # ------------------------------------------------------------------
+    # Peer discovery
+    # ------------------------------------------------------------------
+
+    def _impact_signals(
+        self, ticket: Ticket, investigation: dict[str, Any]
+    ) -> list[ImpactSignal]:
+        """Declare the consequences of the change this agent is proposing.
+
+        This is how an agent finds its collaborators without knowing who they
+        are. Return one ``ImpactSignal`` per consequence, tagged with a concern
+        from ``discovery.CONCERNS``; the directory resolves each concern to the
+        team authoritative on it.
+
+        Name consequences, not teams. "This change adds a field to a request
+        schema" is a signal. "Ask kafka-clients" is a hardcoded peer list
+        wearing a signal's clothes — it breaks the moment the org changes shape.
+
+        Returning an empty list means the agent believes the change is entirely
+        within its own boundary, and it will deliberate with nobody.
+        """
+        return []
+
+    def _discover_peers(
+        self, ticket: Ticket, investigation: dict[str, Any]
+    ) -> DiscoveryResult:
+        """Resolve this agent's impact signals to the teams that must weigh in.
+
+        Falls back to the legacy ``_select_peers()`` hook when a subclass
+        declares no signals, so agents that name peers directly keep working.
+        """
+        signals = self._impact_signals(ticket, investigation)
+
+        if not signals:
+            named = self._select_peers(ticket, investigation)
+            if named:
+                logger.info(
+                    "[%s] no impact signals declared; using _select_peers() fallback",
+                    self.AGENT_NAME,
+                )
+            return DiscoveryResult(
+                signals=[],
+                decisions=[
+                    PeerDecision(
+                        agent_id=peer_id,
+                        consult=True,
+                        reason="Named directly by the owning agent.",
+                        codepath=codepath,
+                    )
+                    for peer_id, codepath in named
+                ],
+            )
+
+        for sig in signals:
+            self._tracer.emit(
+                phase="discovery", agent=self.AGENT_NAME, kind="signal",
+                title=sig.concern, detail=sig.evidence, codepath=sig.codepath,
+            )
+
+        result = discover_peers(signals, self_id=self.AGENT_NAME)
+
+        for decision in result.decisions:
+            if decision.agent_id == self.AGENT_NAME:
+                continue
+            self._tracer.emit(
+                phase="discovery", agent=self.AGENT_NAME, kind="peer_decision",
+                to_agent=decision.agent_id,
+                title=f"{'consult' if decision.consult else 'skip'} {decision.agent_id}",
+                detail=decision.reason,
+                consult=decision.consult,
+                matched_concerns=decision.matched_concerns,
+                codepath=decision.codepath,
+                reachable=decision.reachable,
+            )
+
+        self._tracer.emit(
+            phase="discovery", agent=self.AGENT_NAME, kind="finding",
+            title=result.summarize(),
+            detail=(
+                "Teams were resolved from the consequences of the proposed change, "
+                "not from a hardcoded peer list. Skipped teams are on the record "
+                "with the reason they were left out."
+            ),
+            consulted=[d.agent_id for d in result.consulted],
+            skipped=[d.agent_id for d in result.skipped if d.agent_id != self.AGENT_NAME],
+        )
+        return result
+
+    # ------------------------------------------------------------------
+    # Trace helpers
+    # ------------------------------------------------------------------
+
+    def _trace_investigation(self, investigation: dict[str, Any]) -> None:
+        """Emit the tool calls and conclusion from an investigation dict.
+
+        Keys whose values came from tools are emitted as ``tool_call`` events;
+        the narrative keys become the agent's conclusion.  A no-op under a
+        NullTracer.
+        """
+        narrative = {"summary", "root_cause", "goals", "non_goals", "agent",
+                     "ticket_id", "tools_available", "testing_strategy",
+                     "execution_order", "risks_and_mitigations",
+                     "rollout_and_rollback", "success_metrics",
+                     "cited_codepaths"}
+        for key, value in investigation.items():
+            if key in narrative or not isinstance(value, dict):
+                continue
+            self._tracer.emit(
+                phase="investigation", agent=self.AGENT_NAME, kind="tool_call",
+                title=key, detail=_brief(value), result=value,
+            )
+        if investigation.get("root_cause"):
+            self._tracer.emit(
+                phase="investigation", agent=self.AGENT_NAME, kind="finding",
+                title="root cause", detail=str(investigation["root_cause"]),
+                cited_codepaths=investigation.get("cited_codepaths", []),
+            )
+
+    def _trace_finding(self, finding: Finding) -> None:
+        for point in finding.human_decision_points:
+            self._tracer.emit(
+                phase="decision", agent=self.AGENT_NAME, kind="escalation",
+                title="needs a human", detail=point,
+            )
+        self._tracer.emit(
+            phase="artifact", agent=self.AGENT_NAME, kind="artifact",
+            title=f"1-pager: {finding.title}",
+            detail=finding.tldr,
+            finding=finding.to_dict(),
+        )
 
     # ------------------------------------------------------------------
     # ConsultAbout workflow
@@ -745,6 +1022,7 @@ class SMEAgentBase:
         deliberation: list[DeliberationRound] | None = None,
         rounds_used: int = 0,
         converged: bool = False,
+        discovery: DiscoveryResult | None = None,
     ) -> Finding:
         """Assemble the 1-page design doc from own investigation + deliberation.
 
@@ -753,12 +1031,24 @@ class SMEAgentBase:
           - a peer flagged that the decision needs organizational authority
             (external process, budget, SLA), or
           - deliberation failed to converge within MAX_DELIBERATION_ROUNDS, or
-          - a peer was unreachable so the analysis is genuinely incomplete.
+          - a peer was unreachable so the analysis is genuinely incomplete, or
+          - discovery found a team that must review but has no agent deployed.
         """
         recommended = next((a for a in alternatives if a.recommended), None)
 
         # --- human escalation decision, made once, here ---
         human_decision_points: list[str] = []
+
+        # Discovery identified a team whose review is required but for whom no
+        # agent exists. Routing around that silently would be the worst option:
+        # the doc would read as complete while missing a required sign-off.
+        for decision in (discovery.consulted if discovery else []):
+            if not decision.reachable:
+                human_decision_points.append(
+                    f"{decision.agent_id} must review this "
+                    f"({', '.join(decision.matched_concerns)}) but has no SME agent "
+                    f"deployed — a human on that team needs to weigh in."
+                )
 
         for resp in responses:
             if resp.needs_org_authority and resp.org_authority_reason:
@@ -825,6 +1115,8 @@ class SMEAgentBase:
             confidence=0.95 if converged else 0.7,
             cited_codepaths=investigation.get("cited_codepaths", []),
             open_questions=open_questions,
+            impact_signals=list(discovery.signals) if discovery else [],
+            peer_discovery=list(discovery.decisions) if discovery else [],
             deliberation=deliberation or [],
             rounds_used=rounds_used,
             converged=converged,

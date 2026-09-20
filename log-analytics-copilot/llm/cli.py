@@ -26,6 +26,8 @@ AGENTS = (
      "Broker routing — fan-out cost, heap budget, KRaft metadata"),
     ("kafka-clients", "deep",
      "Kafka wire protocol — compatibility, AdminClient, KIP process"),
+    ("kafka-security", "small",
+     "Authorization — ACLs, information disclosure, authorizer cost"),
 )
 
 

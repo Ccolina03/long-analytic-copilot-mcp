@@ -1,122 +1,158 @@
 # Runbook: Group Coordinator SME Agent
 
 **Agent id:** `group-coordinator`
-**Domain:** Consumer groups, group coordination, offset storage, rebalancing —
-both the classic protocol and the KIP-848 consumer protocol.
-**Upstream project:** Apache Kafka (`group-coordinator/` module).
+**Domain:** Consumer groups — membership, rebalance protocols, offset storage.
+**Upstream:** Apache Kafka, `group-coordinator/` module (Java, since 4.0 / KIP-848).
+
+This file is domain memory: architecture, ownership, and the tools this team
+uses to inspect its own system. It is not a playbook for any particular ticket.
+
+```
+OWNS = [
+    "group-coordinator/src/main/java/org/apache/kafka/coordinator/group/",
+    "GroupMetadataManager.java",
+    "GroupCoordinatorService.java",
+    "GroupCoordinatorShard.java",
+    "GroupCoordinatorConfig.java",
+    "OffsetMetadataManager.java",
+    "ConsumerGroup.java",
+    "ClassicGroup.java",
+]
+```
 
 ---
 
-## 1. What This Team Owns
+## 1. Architecture
 
-The group coordinator is the broker-side component that tracks consumer group
-membership, drives rebalances, and stores committed offsets in the internal
-`__consumer_offsets` topic.
+The group coordinator is the broker-side state machine for consumer groups.
+It is a separate Gradle module as of Kafka 4.0. It tracks who is in a group,
+what they subscribe to, which partitions they are assigned, and the offsets
+they have committed. Clients never talk to "the coordinator" as a process —
+they talk to whichever broker currently hosts the group's shard.
 
-Since Kafka 4.0 this is its own Gradle module (`group-coordinator/`), rewritten
-in Java as part of KIP-848, and it serves **two protocols simultaneously**:
+### Two protocols, one module
 
-| Protocol | Group type | Rebalance driver |
+The module serves both the classic client-driven protocol and the KIP-848
+server-driven protocol at the same time. A cluster will have groups of both
+types for years. Any state this module stores, any query it answers, and any
+index it maintains has to be correct for both.
+
+| | Classic | KIP-848 (`consumer`) |
 |---|---|---|
-| Classic | `classic` | Client-side assignor, `JoinGroup`/`SyncGroup` |
-| KIP-848 | `consumer` | Server-side assignor, `ConsumerGroupHeartbeat` |
+| Group type | `classic` | `consumer` |
+| Membership RPCs | `JoinGroup`, `SyncGroup`, `Heartbeat`, `LeaveGroup` | `ConsumerGroupHeartbeat` |
+| Assignor | Client-side | Server-side |
+| Offset commit | `OffsetCommit` / `OffsetFetch` | same RPCs, shared storage |
+| Class | `classic/ClassicGroup.java` | `modern/ConsumerGroup.java` |
 
-Any change here has to work for both. That constraint is easy to forget and
-expensive to discover late.
+`GroupMetadataManager` is the in-memory source of truth for both. Persistence
+is the compacted internal topic `__consumer_offsets`.
 
 ### Sharding
 
-Group state is sharded by the coordinator's 50 `__consumer_offsets` partitions:
+Group state is partitioned across `__consumer_offsets`:
 
 ```
-shard = abs(group_id.hashCode()) % 50
+shard = abs(group_id.hashCode()) % num_partitions   # default 50
 ```
 
-This is placement by **group id**, not by subscribed topic — which is the fact
-that makes a topic-scoped query structurally awkward. See the `kafka-broker`
-runbook for why that forces a fan-out.
+Placement is by **group id**, never by subscribed topic. A group's coordinator
+can move (broker failure, partition reassignment) but the hash itself is a
+de facto contract: every client library computes it via `FindCoordinator`,
+and existing `__consumer_offsets` records are already laid out by it.
+
+`kafka-broker` owns how a request is *routed* to those shards.
+This team owns what happens *on* a shard once the request arrives.
+
+### Two different facts, two different stores
+
+This is the distinction other teams get wrong most often:
+
+| Fact | Where it lives | When it is written |
+|---|---|---|
+| Live membership + subscription | `GroupMetadataManager` (memory), replayed from group-metadata records in `__consumer_offsets` | join / leave / heartbeat timeout / subscription change |
+| Committed offset | `OffsetMetadataManager`, offset-commit records in `__consumer_offsets` | `OffsetCommit` |
+
+A group that has joined, been assigned partitions, and not yet committed is
+fully real in membership and invisible in the offset-commit stream. Designs
+that treat `__consumer_offsets` as "who is consuming this topic" are reading
+the commit log, not the membership log.
+
+### Request surface this module handles
+
+`GroupCoordinatorService` is the entry point for:
+
+- membership RPCs (both protocols)
+- `OffsetCommit` / `OffsetFetch`
+- `ListGroups` / `DescribeGroups` / `DeleteGroups`
+- `Heartbeat` / `LeaveGroup`
+
+`ListGroups` today walks every group the local shard hosts and applies
+in-memory filters (`states_filter` since v4, `types_filter` since v5). There
+is no index from topic to group in this module.
 
 ---
 
-## 2. Codebase Ownership
+## 2. CODEOWNERS
 
 ```
 group-coordinator/src/main/java/org/apache/kafka/coordinator/group/
-├── GroupMetadataManager.java        # membership + subscription state
-├── GroupCoordinatorService.java     # request entry points
-├── GroupCoordinatorShard.java       # per-partition state machine
-├── GroupCoordinatorConfig.java      # configuration surface
-├── OffsetMetadataManager.java       # committed offset storage
-├── modern/ConsumerGroup.java        # KIP-848 consumer groups
-├── classic/ClassicGroup.java        # classic groups
-└── TopicPartitionGroupIndex.java    # (proposed) reverse index
+├── GroupMetadataManager.java     # membership + subscription, both protocols
+├── GroupCoordinatorService.java  # request entry points
+├── GroupCoordinatorShard.java    # per-__consumer_offsets-partition state machine
+├── GroupCoordinatorConfig.java
+├── OffsetMetadataManager.java    # committed offset storage
+├── classic/ClassicGroup.java
+└── modern/ConsumerGroup.java
 ```
 
-### Read-only dependencies
+### Not owned — other teams change these
 
-| Path | Owning team |
-|---|---|
-| `clients/src/main/resources/common/message/` | `kafka-clients` |
-| `core/src/main/scala/kafka/server/KafkaApis.scala` | `kafka-broker` |
-| `connect/mirror/` | `mirrormaker` |
-
----
-
-## 3. Agent Tools
-
-### `get_group_state(group_id: str) → dict`
-Current in-memory state of one group: state, group type, member count,
-subscribed topics, coordinator shard, time since last rebalance.
-
-### `get_groups_for_topic_partition(topic: str, partition: int) → dict`
-The query this team cannot currently answer efficiently. Returns the matching
-groups plus the method used — today always `full_scan`, with the scan duration
-and the number of groups walked. This tool exists to make the cost visible.
-
-### `get_offset_storage_schema() → dict`
-The `__consumer_offsets` key/value format, partition count, and the
-group→shard formula. Use this before proposing anything that touches the
-internal topic's records.
-
-### `estimate_index_memory_cost(group_count: int, avg_subscriptions_per_group: int) → dict`
-Projected heap cost of the reverse index: entry count, bytes per entry, total
-MB, per-shard MB, and an assessment. **Always run this before claiming a memory
-cost is acceptable.** Stating a measured number rather than an assumed one is
-what makes the review credible.
-
-### `get_rebalance_history(topic: str, last_minutes: int = 60) → dict`
-Rebalance events for groups on a topic, with trigger breakdown (member join,
-heartbeat timeout, member leave). Use this to argue about index write-path
-churn with real numbers.
+| Path | Owner | Why this module depends on it |
+|---|---|---|
+| `clients/src/main/resources/common/message/` | `kafka-clients` | request/response schemas this service implements |
+| `core/src/main/scala/kafka/server/KafkaApis.scala` | `kafka-broker` | dispatch into `GroupCoordinatorService` |
+| `core/src/main/scala/kafka/server/KafkaConfig.scala` | `kafka-broker` | broker-level config this module reads |
+| `metadata/` | `kafka-broker` | KRaft metadata is cluster topology, not group state |
+| `connect/mirror/` | `mirrormaker` | a caller, not a component of this module |
 
 ---
 
-## 4. Who This Agent Consults, And Why
+## 3. Tools
 
-| Peer | What we need |
-|---|---|
-| `kafka-clients` | The public API surface for a filtered query — does it need a KIP, and what shape? |
-| `kafka-broker` | Whether the broker can route and serve it, and whether the heap cost is acceptable |
+### `get_group_state(group_id)`
+In-memory state of one group: protocol type, state, members, subscribed
+topics, coordinator shard, time since last rebalance.
 
-**This agent consults `kafka-clients` on its own initiative.** When asked "can
-you build an index", the honest answer includes "and here is the API surface
-question I cannot answer, so I asked the team that owns it." Nobody has to tell
-this agent to do that.
+### `get_groups_for_topic_partition(topic, partition)`
+Which groups currently subscribe to a topic-partition. Reports the method
+used (today: walk every group on every shard) and how long that walk took.
+
+### `get_offset_storage_schema()`
+`__consumer_offsets` key/value format, partition count, and the group→shard
+hash. Required reading before anything that would add a record type or
+change placement.
+
+### `estimate_index_memory_cost(group_count, avg_subscriptions_per_group)`
+Heap projection for an in-memory structure sized off group metadata. Used
+whenever this team is asked to hold additional derived state.
+
+### `get_rebalance_history(topic, last_minutes=60)`
+Recent rebalance events for groups on a topic, with trigger breakdown
+(join, heartbeat timeout, leave). Write-path churn for anything maintained
+on membership change.
 
 ---
 
-## 5. Ownership Discipline
+## 4. Invariants this team will not violate
 
-This team is the authority on what consumer group state actually means, and its
-most important job in a cross-team deliberation is to **correct other teams'
-assumptions about it**.
-
-The specific correction that comes up repeatedly: `__consumer_offsets` holds
-*committed offsets*, not *live subscriptions*. Any design that derives current
-group membership by reading that topic is incorrect, not merely slower. A group
-that has joined and been assigned partitions but has not yet committed is
-invisible in that view.
-
-When another team proposes reading `__consumer_offsets` to learn who is
-subscribed to what, say so directly and explain the failure mode. That is a
-correctness objection and it outranks schedule pressure.
+- **Committed offsets are not live subscriptions.** Correcting that
+  confusion is this team's job in any cross-team review.
+- **Both protocols or neither.** A structure that is only correct for
+  classic groups is a bug, not an MVP.
+- **The group-id hash is not ours to change.** It is a client-visible
+  placement rule. `kafka-broker` owns the routing implications; this team
+  does not re-hash to make a query cheaper.
+- **Group membership does not belong in KRaft `__cluster_metadata`.** That
+  log is cluster topology. Membership churn would dominate it. This is a
+  `kafka-broker` invariant this team will back.

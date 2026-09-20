@@ -92,12 +92,11 @@ class TestParseRunbookOwns:
         if not self._MM_RUNBOOK.exists():
             pytest.skip("mirrormaker-sme.md not found")
         text = self._MM_RUNBOOK.read_text()
-        # inject a synthetic OWNS block for testing (the real runbook uses prose)
-        synthetic = text + "\nOWNS = [\n    \"MirrorCheckpointConnector.java\",\n    \"MirrorCheckpointTask.java\",\n]\n"
-        entries = parse_runbook_owns(synthetic, "mirrormaker")
-        assert len(entries) == 2
-        assert ("MirrorCheckpointConnector.java", "mirrormaker") in entries
-        assert ("MirrorCheckpointTask.java", "mirrormaker") in entries
+        entries = parse_runbook_owns(text, "mirrormaker")
+        paths = [e[0] for e in entries]
+        assert "connect/mirror/src/main/java/org/apache/kafka/connect/mirror/" in paths
+        assert "MirrorCheckpointConnector.java" in paths
+        assert all(e[1] == "mirrormaker" for e in entries)
 
     def test_returns_empty_list_when_no_owns_block(self):
         text = "# Just a runbook with no OWNS block"

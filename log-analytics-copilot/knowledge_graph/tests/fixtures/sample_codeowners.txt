@@ -7,6 +7,8 @@
 /clients/src/main/java/org/apache/kafka/clients/admin/ @kafka-clients
 /core/src/main/scala/kafka/server/                 @kafka-broker
 /metadata/src/main/java/org/apache/kafka/controller/ @kafka-broker
+/metadata/src/main/java/org/apache/kafka/metadata/authorizer/ @kafka-security
+/clients/src/main/java/org/apache/kafka/common/acl/ @kafka-security
 
 # Wildcard example
 *.proto                                            @platform-team

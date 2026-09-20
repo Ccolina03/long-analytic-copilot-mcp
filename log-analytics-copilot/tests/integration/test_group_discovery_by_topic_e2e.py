@@ -28,12 +28,9 @@ import pathlib
 
 import pytest
 
-from agents.base_agent import DirectTransport
-from agents.group_coordinator_agent import GroupCoordinatorAgent
-from agents.kafka_broker_agent import KafkaBrokerAgent
 from agents.design_doc import render_one_pager
 from agents.mirrormaker_agent import MirrorMakerAgent
-from agents.kafka_clients_agent import KafkaClientsAgent
+from agents.network import build_network
 from agents.ownership_validator import validate_citations
 from proto.sme_agents import Ticket
 
@@ -46,24 +43,14 @@ _FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 @pytest.fixture(scope="module")
 def network():
-    clients = KafkaClientsAgent()
-    broker = KafkaBrokerAgent()
-    # group-coordinator consults kafka-clients on its own initiative.
-    coordinator = GroupCoordinatorAgent(
-        transport=DirectTransport({"kafka-clients": clients})
-    )
-    mm_transport = DirectTransport({
-        "group-coordinator": coordinator,
-        "kafka-broker": broker,
-        "kafka-clients": clients,
-    })
-    mirrormaker = MirrorMakerAgent(transport=mm_transport)
+    net = build_network()
     return {
-        "mirrormaker": mirrormaker,
-        "coordinator": coordinator,
-        "broker": broker,
-        "clients": clients,
-        "mm_transport": mm_transport,
+        "mirrormaker": net["mirrormaker"],
+        "coordinator": net["group-coordinator"],
+        "broker": net["kafka-broker"],
+        "clients": net["kafka-clients"],
+        "security": net["kafka-security"],
+        "mm_transport": net["mirrormaker"]._transport,
     }
 
 
@@ -162,6 +149,8 @@ class TestDeliberation:
         consulted = {r.to_agent for r in finding.deliberation}
         assert "group-coordinator" in consulted
         assert "kafka-clients" in consulted
+        assert "kafka-broker" in consulted
+        assert "kafka-security" in consulted
 
     def test_consumer_team_consulted_before_oss_kafka(self, finding):
         order = [r.to_agent for r in finding.deliberation]
@@ -251,9 +240,39 @@ class TestSubstantivePushback:
         assert kraft[0].is_ruled_out
         assert "32x" in kraft[0].rejected_reason
 
+    def test_security_was_discovered_not_hardcoded(self, finding):
+        """mirrormaker never names kafka-security. Discovery pulls it in
+        because the filter exposes the topic→group relationship."""
+        consulted = {d.agent_id for d in finding.peer_discovery if d.consult}
+        skipped = {d.agent_id for d in finding.peer_discovery if not d.consult}
+        assert "kafka-security" in consulted
+        assert "kafka-storage" in skipped
+        assert "kafka-streams" in skipped
+        assert "kafka-connect" in skipped
+        assert "kafka-tools" in skipped
+        concerns = {s.concern for s in finding.impact_signals}
+        assert "authorization" in concerns
+
+    def test_security_caught_the_authorization_gap(self, network, ticket):
+        from proto.sme_agents import ImpactRequest
+        req = ImpactRequest.new(
+            from_agent="mirrormaker", to_agent="kafka-security",
+            ticket_id=ticket.ticket_id, request_type="design_review",
+            question="does this filter need authorization?", round_number=1,
+        )
+        resp = network["security"].consult_about(req, depth=0)
+        joined = (" ".join(resp.new_concerns) + resp.principal_review).lower()
+        assert "authorization" in joined
+        assert "oracle" in joined or "omission" in joined or "omit" in joined
+
     def test_every_agent_produced_a_principal_review(self, network, ticket):
         from proto.sme_agents import ImpactRequest
-        for agent_key, agent_name in (("coordinator", "group-coordinator"), ("broker", "kafka-broker"), ("clients", "kafka-clients")):
+        for agent_key, agent_name in (
+            ("coordinator", "group-coordinator"),
+            ("broker", "kafka-broker"),
+            ("clients", "kafka-clients"),
+            ("security", "kafka-security"),
+        ):
             req = ImpactRequest.new(
                 from_agent="mirrormaker", to_agent=agent_name,
                 ticket_id=ticket.ticket_id, request_type="design_review",
@@ -329,10 +348,10 @@ class TestOnePagerContent:
     def test_has_five_execution_steps(self, finding):
         assert len(finding.execution_order) == 5
 
-    def test_testing_strategy_aggregates_all_four_teams(self, finding):
+    def test_testing_strategy_aggregates_all_teams(self, finding):
         joined = " ".join(finding.testing_strategy)
         for team in ("mirrormaker", "group-coordinator", "kafka-broker",
-                     "kafka-clients"):
+                     "kafka-clients", "kafka-security"):
             assert team in joined, f"{team} contributed no test requirements"
 
     def test_has_risks_rollout_and_success_metrics(self, finding):
@@ -340,9 +359,10 @@ class TestOnePagerContent:
         assert len(finding.rollout_and_rollback) >= 3
         assert len(finding.success_metrics) >= 3
 
-    def test_teams_involved_covers_four_teams_with_roles(self, finding):
+    def test_teams_involved_covers_discovered_teams_with_roles(self, finding):
         teams = {t.team: t for t in finding.teams_involved}
-        assert {"mirrormaker", "group-coordinator", "kafka-clients", "kafka-broker"} <= set(teams)
+        assert {"mirrormaker", "group-coordinator", "kafka-clients",
+                "kafka-broker", "kafka-security"} <= set(teams)
         assert teams["mirrormaker"].role == "owner"
         assert teams["kafka-clients"].sign_off_required is True
 

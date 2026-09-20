@@ -12,11 +12,14 @@ from __future__ import annotations
 
 import pytest
 
-from agents.base_agent import DirectTransport, SMEAgentBase
+from agents.base_agent import SMEAgentBase
 from agents.group_coordinator_agent import GroupCoordinatorAgent
 from agents.design_doc import render_one_pager
-from agents.mirrormaker_agent import MirrorMakerAgent
+from agents.kafka_broker_agent import KafkaBrokerAgent
 from agents.kafka_clients_agent import KafkaClientsAgent
+from agents.kafka_security_agent import KafkaSecurityAgent
+from agents.mirrormaker_agent import MirrorMakerAgent
+from agents.network import build_network as wire_network
 from llm.budget import TicketBudget
 from llm.client import AgentLLM
 from llm.provider import LLMProvider, LLMResponse
@@ -71,20 +74,11 @@ def ticket() -> Ticket:
 
 
 def build_network(llms: dict[str, AgentLLM] | None = None):
-    """Wire the three real agents together, optionally with LLM handles."""
-    llms = llms or {}
-    mirrormaker = MirrorMakerAgent(llm=llms.get("mirrormaker"))
-    coordinator = GroupCoordinatorAgent(llm=llms.get("group-coordinator"))
-    clients = KafkaClientsAgent(llm=llms.get("kafka-clients"))
+    """Wire the implemented network. Returns the original 3-tuple so existing
+    tests keep unpacking; broker and security are still in the transport."""
+    net = wire_network(llms=llms or {})
+    return net["mirrormaker"], net["group-coordinator"], net["kafka-clients"]
 
-    peers = {
-        "mirrormaker": mirrormaker,
-        "group-coordinator": coordinator,
-        "kafka-clients": clients,
-    }
-    for agent in peers.values():
-        agent._transport = DirectTransport(peers)
-    return mirrormaker, coordinator, clients
 
 
 def scripted_llms(text: str, budget: TicketBudget | None = None):
@@ -155,13 +149,15 @@ class TestAgentTiers:
 
     def test_every_agent_declares_a_valid_tier(self):
         from llm.registry import TIERS
-        for cls in (MirrorMakerAgent, GroupCoordinatorAgent, KafkaClientsAgent):
+        for cls in (MirrorMakerAgent, GroupCoordinatorAgent, KafkaClientsAgent,
+                    KafkaBrokerAgent, KafkaSecurityAgent):
             assert cls.LLM_TIER in TIERS
             assert cls.LLM_DESIGN_TIER in TIERS
 
     def test_design_tier_is_never_weaker_than_routine_tier(self):
         from llm.registry import tier_index
-        for cls in (MirrorMakerAgent, GroupCoordinatorAgent, KafkaClientsAgent):
+        for cls in (MirrorMakerAgent, GroupCoordinatorAgent, KafkaClientsAgent,
+                    KafkaBrokerAgent, KafkaSecurityAgent):
             assert tier_index(cls.LLM_DESIGN_TIER) >= tier_index(cls.LLM_TIER), (
                 f"{cls.__name__} would downgrade for design review"
             )
