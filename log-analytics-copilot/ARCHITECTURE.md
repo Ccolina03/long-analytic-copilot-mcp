@@ -683,39 +683,78 @@ Gated behind sustained Phase 2 accuracy in production.
 
 The demo is not "we have an AI that knows your docs." It's watching a
 ticket get triaged by a live network of specialists, with a visible
-timeline of who talked to whom and why.
+timeline of who talked to whom and why. This is the exact §10 worked
+example, replayed as a live timeline — **the tools, runbooks, and
+consultation flow below are the actual product surface**, not a mockup.
 
 ```
-13:42:01  Ticket received
+13:42:01  Ticket received:
+          "Cluster Linking offset clamping during failover is too slow.
+           Currently calls ListGroups() on entire cluster then filters."
 
-13:42:08  Cluster Linking Agent claims ticket
+13:42:08  Orchestrator queries Knowledge Graph (§5):
+          "ListGroups" codepath   → owned_by → consumer-team
+          "clampOffsets" codepath → owned_by → kora-global
+          → routes to: kora-global, consumer-team, oss-kafka
 
-13:42:21  → asks KRaft Agent about metadata transition
+13:42:12  kora-global-agent claims ticket (proposer — filed the pain)
+          tool: get_failover_latency()   → p99=11,400ms, 91% in listGroups
+          tool: get_offset_clamp_trace() → bottleneck confirmed, 50,312
+                                            groups scanned, 4 matched
+          Finding: needs_from=[consumer-team, oss-kafka], confidence=0.95
 
-13:42:27  → asks Producer Agent about rebootstrap
+13:42:21  kora-global → consumer-team: ImpactRequest
+          "Need ListGroupsForTopicPartition(topic, partition). Can
+           GroupCoordinator support an indexed lookup? What's the cost?"
 
-13:42:31  → asks Consumer Agent about offset behavior
+13:42:27  consumer-team-agent responds (code owner — GroupCoordinator)
+          tool: get_offset_storage_schema() → no reverse index exists today
+          tool: estimate_index_memory_cost() → ~14MB for 50k-group cluster
+          ImpactResponse:
+            affected_components: [GroupCoordinator, GroupMetadata]
+            invariants: ["group state must stay consistent across rebalance"]
+            confidence: 0.9
+            open_questions: ["needs new Kafka API version — ask oss-kafka"]
 
-13:42:44  Agents identify shared codepath
+13:42:31  consumer-team → oss-kafka: ImpactRequest
+          "Does adding a topic_partitions filter to ListGroups v5 need a KIP?"
 
-13:43:12  Root cause identified
+13:42:44  oss-kafka-agent responds (upstream gate — protocol + KIP process)
+          tool: search_kips("ListGroups topic partition filter")
+               → "KIP-518 is closest precedent, does NOT cover this.
+                   New KIP required."
+          tool: check_compat(api_key=16, proposed_version=5, ...)
+               → PASS, with note: "KIP-848 compatibility needs explicit review"
+          ImpactResponse: impact=HIGH, confidence=0.92
 
-13:44:05  Regression test generated
+13:43:12  Orchestrator validates all cited codepaths against ownership (§7)
+          → all valid, no unverified claims
 
-13:45:19  PR opened
+13:43:20  Orchestrator builds TriageResult:
+          execution_order: [kora-global confirm scope → consumer-team draft
+                            KIP → oss-kafka community vote (~4wk) →
+                            consumer-team implement → kora-global integrate]
+          approvals_needed: [consumer-team lead, oss-kafka committer]
+          requires_human: true
+          escalation_reason: "Two team lead approvals required before
+                               implementation can begin"
 
-13:45:22  Ticket updated with:
-          - root cause
-          - affected components
-          - evidence
-          - PR
-          - unresolved questions
+13:43:22  Ticket updated with:
+          - root cause: no reverse index on GroupCoordinator + no protocol
+            filter field
+          - affected components: GroupCoordinator, ListGroupsRequest v5
+          - evidence: latency traces, KIP-518 precedent search
+          - execution order + approvals needed
+          - unresolved question: KIP-848 compatibility
 ```
 
 Every line in that timeline corresponds to a real, typed message in the
-protocol from §6 — not a scripted narration. The demo should be able to
-show the raw `ImpactRequest`/`ImpactResponse` JSON behind any line on
-request, because that auditability is the product.
+protocol from §6 and a real tool call declared in the agent's runbook
+(§4 Domain Memory) — not a scripted narration. The demo should be able to
+show the raw `ImpactRequest`/`ImpactResponse` JSON and the underlying tool
+output behind any line on request, because that auditability — grounded in
+the specific tools and runbooks in [`runbooks/`](./runbooks/) — is the
+product, not a generic multi-agent chat log.
 
 ---
 
