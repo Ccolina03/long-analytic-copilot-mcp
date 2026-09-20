@@ -1071,17 +1071,17 @@ a { color: var(--accent); }
   place-items: center;
   pointer-events: none;
   background: rgba(2, 5, 7, 0.42);
-  animation: beat-stage 2.8s cubic-bezier(0.22, 0.8, 0.2, 1) forwards;
+  animation: beat-stage 3s cubic-bezier(0.22, 0.8, 0.2, 1) forwards;
 }
 .beat-banner {
-  width: min(560px, 88vw);
+  width: min(580px, 90vw);
   padding: 28px 32px 24px;
   text-align: left;
   background: rgba(8, 14, 18, 0.96);
   border: 1px solid rgba(30, 200, 191, 0.4);
   border-radius: 12px;
   box-shadow: 0 0 0 1px rgba(30, 200, 191, 0.08), 0 28px 60px rgba(0, 0, 0, 0.55);
-  animation: beat-banner 2.8s cubic-bezier(0.22, 0.8, 0.2, 1) forwards;
+  animation: beat-banner 3s cubic-bezier(0.22, 0.8, 0.2, 1) forwards;
   overflow: hidden;
 }
 .beat-banner-kicker {
@@ -1102,6 +1102,14 @@ a { color: var(--accent); }
   text-transform: uppercase;
   font-weight: 600;
   color: var(--muted);
+}
+.beat-banner-voice {
+  margin-left: auto;
+  font-size: 11px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  font-weight: 600;
+  color: #0F7B75;
 }
 .beat-banner-title {
   margin: 12px 0 0;
@@ -1133,7 +1141,7 @@ a { color: var(--accent); }
   inset: 0 auto 0 0;
   width: 0;
   background: var(--accent);
-  animation: beat-progress 2.8s linear forwards;
+  animation: beat-progress 3s linear forwards;
 }
 @keyframes beat-stage {
   0% { opacity: 0; }

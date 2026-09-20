@@ -8,46 +8,47 @@ export type Beat = {
   line: string;
 };
 
+/** Spoken like an SME on the mesh — first person, from inside the work. */
 export const BEATS: Beat[] = [
   {
     id: "intake",
     step: "1",
     label: "Intake",
-    title: "A Jira ticket lands",
-    line: "Routed to the owning SME — no central orchestrator.",
+    title: "This one's mine",
+    line: "Jira just routed KAFKA-18231 to me — MirrorMaker. I own the checkpoint path, so I pick it up.",
   },
   {
     id: "investigate",
     step: "2",
     label: "Investigate",
-    title: "Owner digs in",
-    line: "MirrorMaker reads runbooks, forms findings, maps blast radius.",
+    title: "I'm digging the failure mode",
+    line: "I'm reading my runbooks and CODEOWNERS. Group discovery is O(n) over every consumer group — that's the p99 burn.",
   },
   {
     id: "discover",
     step: "3",
     label: "Discover",
-    title: "Who enters the room",
-    line: "Consult teams that own the impact. Skip everyone else.",
+    title: "I decide who enters the room",
+    line: "I wire in Coordinator, Broker, Clients, Security — they own the blast radius. Storage, Streams, Connect, Tools: I skip them.",
   },
   {
     id: "deliberate",
     step: "4",
     label: "Deliberate",
-    title: "Peers talk on the mesh",
-    line: "Asks and replies fly until the design holds.",
+    title: "We pressure-test the design",
+    line: "I ask each peer for impact. They answer across the mesh — needs_changes, concerns, ownership — until we converge.",
   },
   {
     id: "decide",
     step: "5",
     label: "Decide",
-    title: "Land the 1-pager",
-    line: "Decision brief: consulted, skipped, recommendation.",
+    title: "Here's the brief I'd hand a human",
+    line: "One page: who I consulted, who I skipped, and the recommendation. You still decide — I just did the routing.",
   },
 ];
 
 /** How long each step banner stays on screen (in + hold + out). */
-export const BEAT_MS = 2800;
+export const BEAT_MS = 3000;
 
 type Props = {
   beat: Beat | null;
@@ -62,6 +63,7 @@ export default function BeatCaption({ beat }: Props) {
         <div className="beat-banner-kicker">
           <span className="beat-banner-step">Step {beat.step}</span>
           <span className="beat-banner-label">{beat.label}</span>
+          <span className="beat-banner-voice">SME · MirrorMaker</span>
         </div>
         <h2 className="beat-banner-title">{beat.title}</h2>
         <p className="beat-banner-line">{beat.line}</p>
