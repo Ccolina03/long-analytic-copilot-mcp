@@ -149,6 +149,25 @@ export default function Page() {
   const jiraTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const spotTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const autoDemo = useRef(false);
+  const musicRef = useRef<HTMLAudioElement | null>(null);
+
+  const stopMusic = () => {
+    const a = musicRef.current;
+    if (!a) return;
+    a.pause();
+    a.currentTime = 0;
+  };
+
+  const startMusic = () => {
+    stopMusic();
+    const a = new Audio("/demo-music.mp3");
+    a.loop = false;
+    a.volume = 0.35;
+    musicRef.current = a;
+    void a.play().catch(() => {
+      /* autoplay may be blocked outside the demo click path */
+    });
+  };
 
   useEffect(() => {
     setReady(true);
@@ -220,6 +239,7 @@ export default function Page() {
 
   const reset = () => {
     stopRef.current?.();
+    stopMusic();
     if (jiraTimer.current) clearTimeout(jiraTimer.current);
     if (spotTimer.current) clearTimeout(spotTimer.current);
     setEvents([]);
@@ -285,6 +305,7 @@ export default function Page() {
     reset();
     setStatus("running");
     setDemoMode(demo);
+    if (demo) startMusic();
     const trace = (await (await fetch("/demo-trace.json")).json()) as Trace & {
       doc?: string;
       ticket?: {
@@ -314,6 +335,19 @@ export default function Page() {
         setDoc(trace.doc ?? null);
         setStatus("done");
         setShowFinale(true);
+        // Soft fade-out over a few seconds once the 1-pager lands
+        const a = musicRef.current;
+        if (a) {
+          const start = a.volume;
+          const t0 = performance.now();
+          const fade = (now: number) => {
+            const t = Math.min(1, (now - t0) / 3500);
+            a.volume = Math.max(0, start * (1 - t));
+            if (t < 1) requestAnimationFrame(fade);
+            else stopMusic();
+          };
+          requestAnimationFrame(fade);
+        }
       },
       demo,
     );

@@ -10,6 +10,9 @@ Specialized engineering agents that pick up a ticket, figure out which teams are
 
 **[▶ Watch the demo (video)](https://github.com/Ccolina03/sme-agent-network/blob/main/log-analytics-copilot/demo/sme-network-demo.webm)**
 
+~80s cut with beat captions, 3× mesh replay, and background music
+(“Calm Loop / Relaxing” by wipics, [CC0](https://opengameart.org/content/calm-loop)).
+
 Or run it locally:
 
 ```bash
