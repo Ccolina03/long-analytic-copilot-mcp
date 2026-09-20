@@ -1,0 +1,9 @@
+{
+  "team": "kora-global",
+  "title": "clampOffsets is slow — 8-12s p99 on clusters with >10k consumer groups",
+  "description": "During a failover operation, ClusterLinking.clampOffsets() must find every consumer group subscribed to the topics being failed over, then translate and clamp their offsets to valid destination positions.\n\nObserved: cluster with 50,000 consumer groups takes 8-12 seconds to complete clampOffsets.\nDuring active failover this causes consumer lag spikes.\nlistGroups + describeGroups fan-out generates a thundering herd on GroupCoordinator.\n\nHypothesis: we need an indexed lookup — listGroupsForTopicPartition(topic, partition) — instead of the current O(n_groups) scan.\n\nNeeds review from Consumer Team (owns GroupCoordinator) and OSS Kafka (protocol change may need a KIP).",
+  "priority": "high",
+  "labels": ["performance", "cluster-linking", "consumer-groups"],
+  "source": "jira",
+  "source_url": "https://jira.confluent.io/browse/KORA-7821"
+}

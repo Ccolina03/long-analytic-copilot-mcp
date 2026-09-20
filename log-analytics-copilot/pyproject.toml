@@ -1,0 +1,15 @@
+[tool.pytest.ini_options]
+testpaths = [
+    "knowledge_graph/tests",
+    "agents/tests",
+    "router/tests",
+    "tests/integration",
+]
+python_files  = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+log_cli = true
+log_cli_level = "WARNING"
+
+[tool.pytest.ini_options.markers]
+integration = "mark a test as requiring live infrastructure (Postgres, gRPC, Docker)"
