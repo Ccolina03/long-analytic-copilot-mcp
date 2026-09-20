@@ -1,32 +1,32 @@
 # SME Agent Network — Architecture
 
 > **One-line pitch:** Give us a bug ticket, and a network of specialized AI
-> engineers — each owning a domain, each armed with the right tools — will
-> figure out who needs to be involved, why, what the dependencies are, and
-> what needs to change. No human plays coordinator.
+> engineers — each with persistent domain ownership, each armed with the
+> right tools — will figure out who needs to be involved, why, what the
+> dependencies are, and what needs to change. No human plays coordinator.
 
 ---
 
 ## Table of Contents
 
 1. [Problem Statement](#1-problem-statement)
-2. [Vision](#2-vision)
-3. [How It Works — End to End](#3-how-it-works--end-to-end)
-4. [Layer-by-Layer Architecture](#4-layer-by-layer-architecture)
-   - 4.1 [Input Layer — API Gateway](#41-input-layer--api-gateway)
-   - 4.2 [Orchestrator Agent](#42-orchestrator-agent)
-   - 4.3 [SME Agents](#43-sme-agents)
-   - 4.4 [Tool Layer — MCP Server](#44-tool-layer--mcp-server)
-   - 4.5 [Observability Layer — Data Pipeline](#45-observability-layer--data-pipeline)
-5. [Communication Protocols](#5-communication-protocols)
-6. [Generic Proto Design](#6-generic-proto-design)
-7. [Worked Example — Consumer Groups Per Topic](#7-worked-example--consumer-groups-per-topic)
-8. [Repository Layout](#8-repository-layout)
-9. [Data Schema](#9-data-schema)
-10. [Adding a New SME Agent](#10-adding-a-new-sme-agent)
-11. [Docker Compose Services](#11-docker-compose-services)
-12. [Build Roadmap](#12-build-roadmap)
-13. [Design Decisions](#13-design-decisions)
+2. [Competitive Landscape — Why This Is Different](#2-competitive-landscape--why-this-is-different)
+3. [Core Thesis](#3-core-thesis)
+4. [The Three-Layer Agent Model](#4-the-three-layer-agent-model)
+5. [The Engineering Knowledge Graph](#5-the-engineering-knowledge-graph)
+6. [Agent-to-Agent Protocol](#6-agent-to-agent-protocol)
+7. [Ownership Boundaries](#7-ownership-boundaries)
+8. [The Ticket as Orchestration Layer](#8-the-ticket-as-orchestration-layer)
+9. [Layer-by-Layer System Architecture](#9-layer-by-layer-system-architecture)
+10. [Worked Example — Consumer Groups Per Topic](#10-worked-example--consumer-groups-per-topic)
+11. [The Moat — Compounding Dependency Graph](#11-the-moat--compounding-dependency-graph)
+12. [Phased Rollout](#12-phased-rollout)
+13. [The Killer Demo](#13-the-killer-demo)
+14. [Repository Layout](#14-repository-layout)
+15. [Data Schema](#15-data-schema)
+16. [Adding a New SME Agent](#16-adding-a-new-sme-agent)
+17. [Build Roadmap](#17-build-roadmap)
+18. [Design Decisions](#18-design-decisions)
 
 ---
 
@@ -41,75 +41,408 @@ When a bug is opened, an engineer has to:
 - Coordinate **approvals** from multiple team leads
 - Keep all of this in their head while also debugging
 
-This process takes hours to days. Most of the delay is **coordination overhead**,
-not actual engineering work.
+This process takes hours to days. Most of the delay is **coordination
+overhead**, not actual engineering work.
 
-The root cause: every engineering organization has a dependency graph — which
-services call which, which teams own what, which changes require whose approval.
-**That graph lives in people's heads, not in any system.**
-
----
-
-## 2. Vision
-
-Build an **AI engineering organization** — a network of specialized SME
-(Subject Matter Expert) agents where:
-
-- **Each agent owns a domain**: its code, architecture, past incidents, historical
-  fixes, and approval authority
-- **Each agent has its own tools**: grounded in real production data from that domain
-- **Agents consult each other**: when a ticket crosses domain boundaries, agents
-  share findings, surface dependencies, and negotiate approvals — autonomously
-- **The network produces a live dependency graph**: built from actual call traces,
-  log correlations, and cross-service evidence — not documentation
-
-The first product is simple:
-
-> **Give us a bug. We'll figure out who needs to be involved, why, and what
-> needs to change.**
+The root cause: every engineering organization has a dependency graph —
+which services call which, which teams own what, which changes require
+whose approval. **That graph lives in people's heads, not in any system.**
 
 ---
 
-## 3. How It Works — End to End
+## 2. Competitive Landscape — Why This Is Different
+
+The multi-agent-orchestration space is already crowded. Before building,
+it's worth being precise about what's already been claimed and where the
+gap is.
+
+| Company | Core abstraction | What they own |
+|---|---|---|
+| **Superset** | Many coding agents → parallel execution | Running hundreds of generic coding agents in parallel on independent tasks |
+| **Agent Relay** | Infrastructure layer | Shared messaging, session history, tools, GitHub/Linear/Slack plumbing between agents |
+| **Glen** | Organizational memory | Aggregates agent sessions, Slack, PRs, tickets, docs — retrieval for future agents |
+| **Linzumi** | Human → many agents | Team chat directs dozens of coding agents; turns org decisions into a source of truth |
+
+**None of them own: persistent domain expertise + structured cross-domain
+reasoning + explicit ownership boundaries.**
 
 ```
-1.  A ticket lands (GitHub issue, Jira, Slack alert)
-         │
-         ▼
-2.  API Gateway authenticates and forwards to Orchestrator (gRPC)
-         │
-         ▼
-3.  Orchestrator classifies which domains are touched
-    (using ticket text + keyword → service mapping from log history)
-         │
-         ▼
-4.  Orchestrator calls Investigate() on each relevant SME Agent in parallel
-         │
-         ├── SME Agent A: runs its domain tools, produces a Finding
-         ├── SME Agent B: runs its domain tools, produces a Finding
-         └── SME Agent C: runs its domain tools, produces a Finding
-         │
-         ▼
-5.  Orchestrator identifies cross-domain dependencies from findings
-    ("Agent B says it's blocked by Agent A's approval")
-         │
-         ▼
-6.  Orchestrator calls ConsultAbout() — agents respond to each other's findings
-    Agent A reads Agent B's finding, updates its own with new context
-         │
-         ▼
-7.  Orchestrator builds the final TriageResult:
-    - Ordered execution plan
-    - Who owns what
-    - What approvals are required
-    - What evidence was found in logs/traces
-    - PR outline
-    - Escalation to human only if a decision genuinely requires one
+Superset:      many agents  →  parallel execution
+Agent Relay:   many agents  →  shared plumbing (messaging/tools/history)
+Glen:          many agents  →  shared memory (retrieval)
+Linzumi:       human        →  many agents (command & control)
+
+THIS PROJECT:  ticket → SME agents → SME agents (typed consultation)
+                      → coordinated action → human approval only when needed
 ```
+
+The distinction that matters:
+
+> Those products answer **"how do agents run / talk / remember."**
+> This product answers **"who should be involved, why, and what's the
+> technical impact — grounded in actual code ownership."**
+
+Agent Relay is closer to an infrastructure layer this product could sit on
+top of — **not a competitor to build a fork of**. Glen is the most adjacent
+risk (organizational memory), but memory is retrieval; this system is
+**reasoning + ownership + action**, and every resolved ticket makes the
+underlying dependency graph structurally better, not just semantically
+searchable.
 
 ---
 
-## 4. Layer-by-Layer Architecture
+## 3. Core Thesis
+
+Before scaling this into a platform, the fundamental hypothesis to prove is:
+
+> **Does specialized agent collaboration — agents with persistent domain
+> ownership, typed communication, and explicit boundaries — actually
+> outperform one powerful coding agent with a giant context window?**
+
+If yes, the multi-agent architecture below is justified.
+If no, none of this complexity is worth building.
+
+This is why the MVP (§12) intentionally starts with **investigation and
+impact analysis only** — no autonomous code changes — until that
+hypothesis is validated against a single-agent baseline.
+
+---
+
+## 4. The Three-Layer Agent Model
+
+Every SME agent is not just "an LLM with a system prompt." It has three
+distinct layers of context that separate *what it permanently knows* from
+*what's happening right now* from *what it's allowed to do*.
+
+```
+                    ┌─────────────────────┐
+                    │   Team SME Agent     │
+                    │  "Cluster Linking    │
+                    │       expert"        │
+                    └──────────┬──────────┘
+                               │
+             ┌─────────────────┼─────────────────┐
+             ▼                 ▼                 ▼
+       DOMAIN MEMORY      LIVE CONTEXT       CAPABILITIES
+     (persistent, slow-    (per-ticket,      (what it's allowed
+      changing)             fast-changing)     to touch/call)
+             │                 │                 │
+       ┌─────┴─────┐      ┌────┴─────┐      ┌────┴─────┐
+       │ Code      │      │ Ticket   │      │ GitHub   │
+       │ ownership │      │ text     │      │ Jira     │
+       │ Design    │      │ Recent   │      │ Slack    │
+       │ decisions │      │ incidents│      │ CI/CD    │
+       │ Historical│      │ Current  │      │ MCP      │
+       │ PRs       │      │ changes  │      │ tools    │
+       │ Invariants│      │ Related  │      │ (scoped) │
+       │ Known bugs│      │ traces   │      │          │
+       │ Tests     │      │          │      │          │
+       └───────────┘      └──────────┘      └──────────┘
+```
+
+### Domain Memory (persistent, curated — not a vector dump)
+
+This is what makes the agent an SME rather than a generic assistant.
+Per §7's ownership boundary, each agent maintains:
+
+- Repositories and specific packages/files it owns
+- Architecture docs and design rationale ("why" behind non-obvious code)
+- Historical PRs and the decisions embedded in them
+- Known invariants (e.g. "PID epoch must remain monotonic")
+- Past incidents and their root causes
+- Test coverage for its owned codepaths
+- Slack/discussion threads that explain tribal knowledge
+
+**Not** a single vector database with everything dumped in. See §5 —
+this is a structured knowledge graph, because "who owns what and what
+depends on what" is a graph problem, not a similarity-search problem.
+
+### Live Context (per-ticket, ephemeral)
+
+The current ticket, related recent incidents, in-flight changes to the
+same codepaths, and any trace/log evidence pulled at investigation time.
+This is what changes every time the agent is invoked — it does not persist
+between tickets (though the *outcome* feeds back into Domain Memory, see §11).
+
+### Capabilities (explicit, scoped)
+
+What the agent is actually allowed to call: GitHub (read PRs, open PRs),
+Jira (read/update tickets), Slack (post updates), CI/CD (trigger test runs),
+and MCP tools (query logs, search code, run domain-specific analyses).
+Capabilities are scoped per agent — the Billing agent cannot open a PR
+against the Broker team's repository.
+
+---
+
+## 5. The Engineering Knowledge Graph
+
+Domain Memory is not a vector database with everything dumped in. It's a
+structured graph, because ownership, dependency, and causality are graph
+relationships — semantic similarity search cannot answer "what does this
+PR block" or "which team must approve this."
+
+**Storage: Postgres** with a graph-shaped schema (edges as rows), not a
+dedicated graph DB — keeps the MVP boring and fast to ship. Move to a real
+graph DB only if query patterns demand it later.
+
+```
+Service
+  ├── owns          → Repository
+  ├── owns          → API
+  ├── depends_on    → Service
+  ├── modifies      → Database
+  ├── emits         → Event
+  ├── consumes      → Event
+  └── has_invariant → Rule
+
+CodePath
+  ├── calls         → CodePath
+  ├── modifies      → State
+  └── protected_by  → Test
+
+Decision
+  ├── applies_to    → CodePath
+  ├── introduced_by → PR
+  └── rationale     → Explanation
+
+Team
+  ├── owns          → Service
+  ├── owns          → Repository
+  └── must_approve  → ChangeType
+```
+
+### Minimal Postgres schema for the MVP
+
+```sql
+CREATE TABLE entities (
+  id          UUID PRIMARY KEY,
+  type        TEXT NOT NULL,   -- 'service' | 'repository' | 'codepath' | 'decision' | 'team' | 'rule'
+  name        TEXT NOT NULL,
+  metadata    JSONB            -- repo path, line ranges, description, etc.
+);
+
+CREATE TABLE edges (
+  id          UUID PRIMARY KEY,
+  from_id     UUID REFERENCES entities(id),
+  to_id       UUID REFERENCES entities(id),
+  relation    TEXT NOT NULL,   -- 'owns' | 'depends_on' | 'calls' | 'protected_by' | 'must_approve' | ...
+  evidence    JSONB,           -- trace_ids, PR links, ticket ids that established this edge
+  confidence  FLOAT DEFAULT 1.0,
+  created_at  TIMESTAMPTZ DEFAULT now(),
+  last_seen_at TIMESTAMPTZ DEFAULT now()
+);
+
+CREATE INDEX idx_edges_from ON edges(from_id, relation);
+CREATE INDEX idx_edges_to   ON edges(to_id, relation);
+```
+
+**Where edges come from:**
+
+| Source | Produces |
+|---|---|
+| Log traces (`trace_id` co-occurrence across services) | `Service --depends_on--> Service`, weighted by call volume |
+| Git history / CODEOWNERS | `Team --owns--> Repository`, `Team --owns--> CodePath` |
+| PR descriptions + review comments | `Decision --applies_to--> CodePath`, `Decision --introduced_by--> PR` |
+| Resolved ticket outcomes (this system's own output) | `ChangeType --must_approve--> Team` (learned from who actually approved past changes) |
+| Static analysis (call graph extraction) | `CodePath --calls--> CodePath` |
+
+This is the compounding asset — see §11.
+
+---
+
+## 6. Agent-to-Agent Protocol
+
+Agents do not "chat" with each other in free-form prose. Free-form chat
+between LLMs produces free-form prose that the *next* LLM has to
+re-interpret — errors compound with every hop. Instead, agents exchange a
+**typed, structured protocol**.
+
+### Request
+
+```json
+{
+  "from": "cluster-linking-agent",
+  "to": "producer-agent",
+  "request_type": "impact_analysis",
+  "change": "producer endpoint switches from cluster A to B",
+  "question": [
+    "What client state is affected?",
+    "What invariants must hold?",
+    "What codepaths handle rebootstrap?"
+  ]
+}
+```
+
+### Response
+
+```json
+{
+  "impact": "HIGH",
+  "affected_components": [
+    "KafkaProducer",
+    "MetadataUpdater",
+    "Sender"
+  ],
+  "invariants": [
+    "PID epoch must remain monotonic",
+    "metadata must be refreshed after endpoint change"
+  ],
+  "codepaths": [
+    "Producer#maybeWaitForProducerId",
+    "Metadata#requestUpdate"
+  ],
+  "tests": [
+    "ProducerRebootstrapTest"
+  ],
+  "confidence": 0.87
+}
+```
+
+**Why this matters architecturally:** the requesting agent (or the
+Orchestrator) reasons over *actual technical claims* — a list of
+components, a list of invariants, a confidence score — instead of another
+LLM's prose summary of prose. This is auditable, diffable, and can be
+validated against the knowledge graph (§5) before being trusted.
+
+### Full request/response schema
+
+```proto
+message ImpactRequest {
+  string from_agent          = 1;
+  string to_agent            = 2;
+  string request_type        = 3;  // "impact_analysis" | "approval" | "evidence_lookup"
+  string change_description  = 4;
+  repeated string questions  = 5;
+  string ticket_id           = 6;
+}
+
+message ImpactResponse {
+  string   impact_level          = 1;  // "LOW" | "MEDIUM" | "HIGH"
+  repeated string affected_components = 2;
+  repeated string invariants     = 3;
+  repeated string codepaths      = 4;
+  repeated string tests          = 5;
+  float    confidence            = 6;
+  repeated string open_questions = 7;  // things the agent could NOT determine
+}
+```
+
+`open_questions` is deliberate — an agent admitting "I don't know" is a
+first-class, structured output, not a hallucinated guess. This is what lets
+the Orchestrator decide when to escalate to a human (§8).
+
+---
+
+## 7. Ownership Boundaries
+
+Every agent has an explicit, non-overlapping ownership boundary — this is
+what turns "five LLMs with different prompts" into something that mirrors
+a real engineering org.
+
+```
+Cluster Linking Agent
+  owns:
+    cluster-link/
+    mirror-topic/
+    switchover/
+
+KRaft Agent
+  owns:
+    metadata/
+    quorum/
+    controller/
+
+Producer Agent
+  owns:
+    clients/producer/
+    clients/transactions/
+
+Consumer Team Agent
+  owns:
+    core/coordinator/group/
+    clients/consumer/
+
+OSS Kafka Agent
+  owns:
+    clients/.../message/*.json     (protocol schema)
+    KIP process / mailing list
+
+Billing Agent
+  owns:
+    metering/
+    pricing/
+    subscriptions/
+```
+
+**The rule:** when an agent's analysis touches a codepath it does not own,
+it must not guess. It issues a typed `ImpactRequest` (§6) to the owning
+agent. This is enforced at the orchestration layer, not just convention —
+the Orchestrator validates that any `codepaths` cited in a `Finding` fall
+within the issuing agent's declared ownership, or flags the finding as
+`needs_verification`.
+
+See `runbooks/*.md` in this repo for the concrete ownership boundaries of
+the three agents currently scaffolded (`kora-global`, `consumer-team`,
+`oss-kafka`) — each runbook lists exact repository paths and line ranges.
+
+---
+
+## 8. The Ticket as Orchestration Layer
+
+The ticket is not something an agent merely *answers*. It is the **unit of
+work** that drives the entire pipeline — investigation, cross-team impact
+analysis, root cause, fix planning, and (later phases) code + tests + PR.
+
+```
+                    Jira / GitHub Ticket
+                            │
+                            ▼
+                    ┌───────────────┐
+                    │  Triage Agent │
+                    └───────┬───────┘
+                            │
+                    identify domains
+              (via knowledge graph §5 +
+               keyword/embedding match)
+                            │
+          ┌─────────────────┼─────────────────┐
+          ▼                 ▼                 ▼
+      CL SME Agent     KRaft SME Agent   Client SME Agent
+          │                 │                 │
+          │◄── ImpactRequest / ImpactResponse ─┤
+          │        (typed protocol, §6)        │
+          └─────────────────┼─────────────────┘
+                            ▼
+                     Impact Analysis
+                            │
+                            ▼
+                       Root Cause
+                            │
+                            ▼
+                      Fix Planner
+                            │
+                  ┌─────────┴─────────┐
+                  ▼                   ▼
+              Code Agent          Test Agent
+                  │                   │
+                  └─────────┬─────────┘
+                            ▼
+                        Draft PR
+                            │
+                            ▼
+                    Human approval gate
+              (only if requires_human=true)
+```
+
+At every stage, the ticket accumulates structured artifacts — findings,
+impact responses, evidence, confidence scores — rather than a growing wall
+of chat transcript. This is what makes the final output auditable:
+"here is the root cause, here is the evidence, here is what's still
+uncertain, here is the proposed fix."
+
+---
+
+## 9. Layer-by-Layer System Architecture
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -120,23 +453,21 @@ The first product is simple:
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  API GATEWAY  (FastAPI)                                              │
-│  • Single external entry point                                       │
-│  • Authentication + rate limiting                                    │
+│  • Single external entry point, auth + rate limiting                 │
 │  • Normalizes ticket format (Jira/GitHub/raw → Ticket proto)        │
-│  • Translates HTTP → gRPC for internal routing                      │
-│  • Streams findings back to caller as they arrive                    │
+│  • Translates HTTP → gRPC, streams findings back as they arrive      │
 └──────────────────────────────┬──────────────────────────────────────┘
                                │ gRPC: TriageTicket(Ticket)
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  ORCHESTRATOR AGENT                                                  │
 │  • Agent registry (SME agents self-register on boot)                │
-│  • Domain classifier (LLM + keyword → which agents to call)        │
+│  • Domain classifier — queries the Knowledge Graph (§5), not just    │
+│    keyword match, to find which agents own the affected entities    │
 │  • Runs Investigate() on all relevant agents in parallel            │
-│  • Reads findings, maps blockers/dependencies                       │
-│  • Runs ConsultAbout() in dependency order                          │
-│  • Builds TriageResult (execution order, approvals, PR outline)     │
-│  • Decides: escalate to human OR open PR autonomously               │
+│  • Routes typed ImpactRequest/Response between agents (§6)          │
+│  • Validates cited codepaths against declared ownership (§7)        │
+│  • Builds TriageResult; escalates to human only if needs_human=true │
 └──────┬────────────┬────────────┬────────────┬────────────┬──────────┘
        │ gRPC       │ gRPC       │ gRPC       │ gRPC       │ gRPC
        ▼            ▼            ▼            ▼            ▼
@@ -146,7 +477,9 @@ The first product is simple:
 │  Kora    │ │ Consumer │ │  OSS     │ │  Broker  │ │ Billing  │
 │  Global  │ │  Team    │ │  Kafka   │ │  Team    │ │  Team    │
 │          │ │          │ │          │ │          │ │          │
-│ [tools]  │ │ [tools]  │ │ [tools]  │ │ [tools]  │ │ [tools]  │
+│ 3-layer  │ │ 3-layer  │ │ 3-layer  │ │ 3-layer  │ │ 3-layer  │
+│ context  │ │ context  │ │ context  │ │ context  │ │ context  │
+│ (§4)     │ │ (§4)     │ │ (§4)     │ │ (§4)     │ │ (§4)     │
 └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘ └────┬─────┘
      │            │            │             │            │
      └────────────┴────────────┴─────────────┴────────────┘
@@ -154,280 +487,34 @@ The first product is simple:
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  MCP TOOL SERVER  (FastAPI)                                          │
-│  query_logs · top_errors · search_keyword · pipeline_status         │
-│  blast_radius · dependency_graph · optimize_table                    │
+│  Shared observability tools, callable by any agent's Capabilities   │
+│  layer: query_logs · top_errors · search_keyword · blast_radius     │
+│  Plus domain-specific tools declared per-agent (see runbooks/)       │
 └──────────────────────────────┬──────────────────────────────────────┘
-                               │ Spark SQL / Delta reads
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
 │  DATA LAYER                                                          │
 │                                                                      │
-│  Kafka (topic: logs.raw)          ← live log stream                 │
-│  Delta Bronze  (bronze_logs)      ← raw, append-only                │
-│  Delta Silver  (silver_logs)      ← parsed, deduped, by service     │
-│  Delta Gold    (gold_error_counts)← per-minute error rollups        │
-│  Delta Tokens  (log_tokens)       ← keyword → event_id index        │
-│  Delta Graph   (service_graph)    ← trace_id → service edges        │
+│  Knowledge Graph (Postgres)  ← entities + edges, the org's memory   │
+│  Log pipeline (Kafka → Delta)← Bronze/Silver/Gold, trace_id edges    │
+│  GitHub/Jira/Slack ingestion ← PRs, decisions, tribal knowledge      │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
----
-
-### 4.1 Input Layer — API Gateway
-
-**Technology:** FastAPI  
-**Port:** 8080 (external)  
-**Responsibility:** Single HTTPS entry point for the outside world.
-
-```
-POST /tickets          ← GitHub webhook, Jira webhook, manual
-GET  /tickets/{id}     ← poll triage status
-GET  /agents           ← which SME agents are registered
-GET  /healthz
-```
-
-Normalizes any ticket format into the generic `Ticket` proto and forwards
-to the Orchestrator via gRPC. Streams `Finding` objects back to the caller
-as each SME agent responds — so the caller sees partial results immediately.
+The log/Kafka/Delta pipeline scaffolded earlier in this repo becomes one
+**input source** to the Knowledge Graph (it's where `Service --depends_on-->
+Service` edges are mined from `trace_id` co-occurrence) — not the center of
+the architecture. The center is the Knowledge Graph plus the typed
+agent protocol.
 
 ---
 
-### 4.2 Orchestrator Agent
-
-**Technology:** Python + gRPC server  
-**Port:** 50050 (internal)  
-**Responsibility:** Coordination, not domain knowledge.
-
-The Orchestrator knows nothing about Kafka, consumer groups, or billing.
-It knows how to:
-
-1. **Classify** — use an LLM to map ticket text to domain keywords, then
-   look up which registered agents own those domains
-2. **Parallelize** — call `Investigate()` on all relevant agents simultaneously
-3. **Sequence** — read `blockers` and `needs_from` fields in each `Finding`
-   to build a dependency-ordered consultation plan
-4. **Aggregate** — merge all findings into a single `TriageResult`
-5. **Decide** — if `needs_human` is false across all findings, autonomously
-   open a PR using the GitHub API; otherwise escalate with full context
-
-The Orchestrator maintains an **agent registry** — a live map of
-`agent_name → grpc_addr + tools`. Agents self-register on boot via
-`RegisterAgent()`. No hardcoded routing.
-
----
-
-### 4.3 SME Agents
-
-**Technology:** Python + gRPC server (one container per agent)  
-**Port:** 50051+ (internal, assigned per agent)  
-**Responsibility:** Deep domain knowledge + tool execution.
-
-Every SME agent:
-
-- Inherits from `SMEAgentBase`
-- Declares its domain in `DOMAIN` (plain English, used by classifier)
-- Adds tools via the `@tool` decorator — each tool is a Python async function
-- Implements the same 3 gRPC RPCs: `GetTools`, `Investigate`, `ConsultAbout`
-
-Tools are the differentiator. Each agent's tools are grounded in its domain's
-real production data. The MCP server provides shared log-level tools; each
-agent adds domain-specific tools on top.
-
-**Current SME Agents:**
-
-| Agent | Domain | Key Tools |
-|---|---|---|
-| `kora-global` | Cluster Linking, failover, offset clamping, topic mirroring | `failover_latency`, `cluster_links`, `offset_clamp_trace`, `mirror_lag` |
-| `consumer-team` | Consumer groups, GroupCoordinator, offsets, rebalancing | `group_state`, `offset_index`, `rebalance_history`, `lag_analysis` |
-| `oss-kafka` | Apache Kafka protocol, KIPs, API versioning, OSS contribution | `kip_search`, `api_key_registry`, `compat_matrix`, `kip_template` |
-| `broker-team` | Topic lifecycle, partition management, log segments | `topic_config`, `partition_health`, `ownership_check`, `schema_impact` |
-| `billing-team` | Usage metering, cost impact, meter definitions | `meter_catalog`, `cost_impact`, `billing_events`, `usage_patterns` |
-
-Adding a new agent = new Python file + new docker-compose service.
-Zero changes to proto, Orchestrator, or existing agents.
-
----
-
-### 4.4 Tool Layer — MCP Server
-
-**Technology:** FastAPI  
-**Port:** 8000 (internal)  
-**Responsibility:** Shared observability tools backed by Delta tables.
-
-All SME agents call these tools via HTTP. The MCP server abstracts Spark SQL
-queries so agents don't need a Spark session.
-
-| Tool | What it does |
-|---|---|
-| `query_logs` | Read-only SQL SELECT against allowed Delta tables |
-| `top_errors` | Most frequent ERROR messages for a service in N minutes |
-| `search_keyword` | Token-index search → joined back to `silver_logs` |
-| `pipeline_status` | Health snapshot of Kafka + Delta pipeline |
-| `optimize_table` | Compact a Delta table (small-file fix) |
-| `blast_radius` | Given a service, find all downstream services via `trace_id` joins |
-| `dependency_graph` | Return the live service call graph built from `trace_id` edges |
-
-The `blast_radius` and `dependency_graph` tools are new — built on a Spark
-aggregation job that mines `trace_id` cross-service co-occurrences from
-`silver_logs` and writes edges to `delta/service_graph`.
-
----
-
-### 4.5 Observability Layer — Data Pipeline
-
-**Technology:** Kafka + Spark Structured Streaming + Delta Lake  
-**Responsibility:** Continuously ingest logs and materialize queryable tables.
-
-```
-loadgen (Go) ──► ingest-gateway (Go gRPC) ──► Kafka: logs.raw
-                                                     │
-                                      Spark Streaming ▼
-                                               Bronze Delta
-                                               (raw, append)
-                                                     │
-                                      Spark Streaming ▼
-                                               Silver Delta
-                                               (parsed, deduped,
-                                                partitioned by
-                                                service/date/hour)
-                                                     │
-                               Spark Batch (scheduled) ▼
-                            ┌──────────────────────────────┐
-                            │  Gold: gold_error_counts      │
-                            │  Tokens: log_tokens           │
-                            │  Graph: service_graph         │
-                            └──────────────────────────────┘
-```
-
-The `service_graph` table is new and critical — it powers the dependency graph:
-
-```sql
--- Built by spark/build_service_graph.py
-SELECT   a.service AS from_service,
-         b.service AS to_service,
-         COUNT(*)  AS co_occurrences
-FROM     silver_logs a
-JOIN     silver_logs b ON a.trace_id = b.trace_id
-                       AND a.service <> b.service
-GROUP BY a.service, b.service
-```
-
-This turns `trace_id` co-occurrence into a directed call graph — every edge
-represents a real request that crossed a service boundary.
-
----
-
-## 5. Communication Protocols
-
-| Between | Protocol | Why |
-|---|---|---|
-| External world → API Gateway | HTTPS / REST | Standard, works with webhooks |
-| API Gateway → Orchestrator | gRPC | Low latency, streaming, typed |
-| Orchestrator → SME Agents | gRPC | Same — agents call each other too |
-| SME Agents → MCP Server | HTTP | MCP is HTTP-native; simple enough |
-| MCP Server → Delta Tables | Spark SQL (PySpark) | Delta is Spark-native |
-| Log producers → Kafka | gRPC (LogIngestionService) | Batching + backpressure built-in |
-| Kafka → Delta | Spark Structured Streaming | Exactly-once, checkpoint recovery |
-
-**Key principle:** gRPC for agent-to-agent (typed, streaming, fast).
-MCP for agent-to-tools (HTTP, discoverable, swappable). These are different
-layers and should not be conflated.
-
----
-
-## 6. Generic Proto Design
-
-One proto file covers all agents. Tools are declared dynamically — agents
-register their own tools at boot. No per-agent proto.
-
-```proto
-// proto/sme_agents.proto
-
-syntax = "proto3";
-package sme.v1;
-
-message Tool {
-  string name        = 1;
-  string description = 2;
-  string agent       = 3;
-  map<string, string> params = 4;
-}
-
-message ToolResult {
-  string tool_name = 1;
-  string agent     = 2;
-  string result    = 3;  // JSON — each tool owns its shape
-  bool   success   = 4;
-  string error     = 5;
-}
-
-message Ticket {
-  string id              = 1;
-  string title           = 2;
-  string description     = 3;
-  string source          = 4;  // "jira" | "github" | "slack"
-  repeated string labels = 5;
-}
-
-message Finding {
-  string   agent                   = 1;
-  string   role                    = 2;  // "proposer"|"code-owner"|"upstream-gate"
-  string   summary                 = 3;
-  repeated string evidence         = 4;  // trace_ids, event_ids, perf numbers
-  repeated string blockers         = 5;  // agent names this agent blocks
-  repeated string needs_from       = 6;  // agent names this agent needs input from
-  repeated ToolResult tool_results = 7;
-  bool     needs_human             = 8;
-  string   escalation_reason       = 9;
-  float    confidence              = 10;
-}
-
-message ConsultRequest {
-  Ticket  ticket         = 1;
-  Finding requesting_from = 2;
-}
-
-message TriageResult {
-  string            ticket_id        = 1;
-  repeated Finding  findings         = 2;
-  repeated string   execution_order  = 3;
-  string            pr_outline       = 4;
-  bool              requires_human   = 5;
-  string            escalation_reason = 6;
-  repeated string   approvals_needed = 7;
-}
-
-// Every SME agent implements these 3 RPCs — no exceptions
-service SMEAgent {
-  rpc GetTools       (Empty)          returns (ToolList);
-  rpc Investigate    (Ticket)         returns (Finding);
-  rpc ConsultAbout   (ConsultRequest) returns (Finding);
-}
-
-service Orchestrator {
-  rpc TriageTicket   (Ticket)         returns (stream Finding);
-  rpc RegisterAgent  (AgentManifest)  returns (Empty);
-}
-
-message AgentManifest {
-  string          agent_name = 1;
-  string          domain     = 2;
-  string          grpc_addr  = 3;
-  repeated Tool   tools      = 4;
-}
-
-message ToolList { repeated Tool tools = 1; }
-message Empty    {}
-```
-
----
-
-## 7. Worked Example — Consumer Groups Per Topic
+## 10. Worked Example — Consumer Groups Per Topic
 
 **Ticket:**
 > "Cluster Linking offset clamping during failover is too slow. Currently
 > calls `ListGroups()` on entire cluster then filters. Need topic-partition
-> scoped group lookup. Affects: Kora Global → Consumer Team → OSS Kafka."
+> scoped group lookup."
 
 **Current bottleneck:**
 ```
@@ -446,145 +533,256 @@ clampOffsets(topic, partition):
     clamp(group, topic, partition)
 ```
 
-**SME Agent Consultation Flow:**
+### Consultation flow, in the typed protocol from §6
 
 ```
-Orchestrator classifies:
-  → kora-global (proposer, has perf evidence)
-  → consumer-team (code owner, GroupCoordinator)
-  → oss-kafka (upstream gate, protocol + KIP)
+13:42:01  Ticket received by Orchestrator
 
-── ROUND 1: Investigate() in parallel ──────────────────────────────
+13:42:08  Orchestrator queries Knowledge Graph:
+          "ListGroups" codepath → owned_by → consumer-team
+          "clampOffsets" codepath → owned_by → kora-global
+          → routes to: kora-global, consumer-team, oss-kafka
 
-kora-global.Investigate(ticket):
-  tool: failover_latency()     → "clampOffsets p99=8200ms, target=50ms"
-  tool: offset_clamp_trace()   → "bottleneck is ListGroups RPC, 50k groups"
-  Finding:
-    summary: "Need ListGroupsForTopicPartition API"
-    evidence: [trace_id_a, trace_id_b, latency histogram]
-    needs_from: ["consumer-team", "oss-kafka"]
-    confidence: 0.95
+13:42:12  kora-global-agent.Investigate(ticket)
+          tool: get_failover_latency() → p99=11,400ms, 91% in listGroups
+          tool: get_offset_clamp_trace() → bottleneck confirmed
+          Finding: needs_from=[consumer-team, oss-kafka], confidence=0.95
 
-consumer-team.Investigate(ticket):
-  tool: offset_index()         → "groups keyed by group_id only, no tp index"
-  tool: group_state()          → "50,312 active groups in cluster"
-  Finding:
-    summary: "New inverted index needed in GroupCoordinator.
-              Option A: in-memory reverse map (group_id, topic, partition).
-              Option B: new scan with early exit.
-              Recommend Option A. Needs new Kafka API key."
-    blockers: ["oss-kafka"]    ← blocks OSS for KIP
-    needs_from: ["kora-global"] ← need scope confirmation
+13:42:21  kora-global → consumer-team: ImpactRequest
+          {
+            "request_type": "impact_analysis",
+            "change": "need topic-partition scoped group lookup",
+            "questions": ["Can GroupCoordinator support an indexed lookup?",
+                          "What's the memory cost?"]
+          }
 
-oss-kafka.Investigate(ticket):
-  tool: kip_search("ListGroups topic partition filter")
-       → "KIP-518 adds state/type filter — NOT topic-partition. No existing KIP."
-  tool: api_key_registry("ListGroups")
-       → "API key 16, current version v4"
-  Finding:
-    summary: "Requires new KIP. Extend ListGroups request v5 with
-              list_groups_for_topic_partitions filter.
-              Old clients (v4): full list (backward compat preserved).
-              Timeline: ~6 weeks to Apache Kafka trunk."
-    needs_from: ["consumer-team"]  ← needs KIP draft from code owner
+13:42:27  consumer-team-agent responds: ImpactResponse
+          {
+            "impact": "MEDIUM",
+            "affected_components": ["GroupCoordinator", "GroupMetadata"],
+            "invariants": ["group state must stay consistent across rebalance"],
+            "codepaths": ["GroupCoordinator#handleListGroups"],
+            "confidence": 0.9,
+            "open_questions": ["needs new Kafka API version — ask oss-kafka"]
+          }
 
-── ROUND 2: ConsultAbout() in dependency order ─────────────────────
+13:42:31  consumer-team → oss-kafka: ImpactRequest
+          "Does adding a topic_partitions filter to ListGroups v5 need a KIP?"
 
-consumer-team.ConsultAbout(kora-global finding):
-  Finding updated:
-    "Confirmed scope: Apache Kafka (not Kora-only).
-     Consumer Team will draft KIP.
-     Option A approved — memory overhead acceptable in cloud."
+13:42:44  oss-kafka-agent responds: ImpactResponse
+          tool: search_kips("ListGroups topic partition filter")
+               → "KIP-518 is closest precedent, does NOT cover this. New KIP required."
+          { "impact": "HIGH", "confidence": 0.92,
+            "open_questions": ["KIP-848 compatibility needs explicit review"] }
 
-oss-kafka.ConsultAbout(consumer-team finding):
-  Finding updated:
-    "KIP accepted for drafting. Sponsor: [oss-kafka committer].
-     Precedent: KIP-518. Draft owner: Consumer Team."
+13:43:12  Orchestrator validates all cited codepaths against ownership (§7)
+          → all valid, no unverified claims
 
-── FINAL: Orchestrator builds TriageResult ─────────────────────────
-
-execution_order:
-  1. kora-global confirms scope             [DONE — confirmed OSS]
-  2. consumer-team drafts KIP               [owner: consumer-team]
-  3. oss-kafka community vote               [~4 weeks]
-  4. consumer-team implements inverted index [after vote]
-  5. kora-global updates clampOffsets()     [after implementation]
-  6. billing-team adds meter if new API     [parallel to step 5]
-
-approvals_needed:
-  - consumer-team lead    (Option A memory trade-off)
-  - oss-kafka committer   (KIP sponsorship)
-
-pr_outline:
-  PR 1: GroupCoordinator in-memory reverse index (consumer-team)
-  PR 2: ListGroups v5 request schema (consumer-team)
-  PR 3: ClusterLinking.clampOffsets() updated call (kora-global)
-
-requires_human: true
-escalation_reason: "Two team lead approvals required before implementation"
+13:43:20  Orchestrator builds TriageResult:
+          execution_order: [kora-global confirm scope → consumer-team draft KIP
+                            → oss-kafka vote (~4wk) → consumer-team implement
+                            → kora-global integrate]
+          approvals_needed: [consumer-team lead, oss-kafka committer]
+          requires_human: true
+          escalation_reason: "Two team lead approvals required before implementation"
 ```
+
+Full domain runbooks for these three agents — including exact repository
+paths, line ranges, and tool specifications — live in:
+
+- [`runbooks/kora-global-sme.md`](./runbooks/kora-global-sme.md)
+- [`runbooks/consumer-team-sme.md`](./runbooks/consumer-team-sme.md)
+- [`runbooks/oss-kafka-sme.md`](./runbooks/oss-kafka-sme.md)
 
 ---
 
-## 8. Repository Layout
+## 11. The Moat — Compounding Dependency Graph
+
+This is the core defensibility argument.
+
+After processing enough tickets, the system learns chains that no single
+document describes anywhere:
+
+```
+Switchover
+   ↓
+Mirror state
+   ↓
+KRaft record
+   ↓
+Metadata propagation
+   ↓
+Producer rebootstrap
+   ↓
+PID/epoch
+   ↓
+EOS transaction
+```
+
+So when a new ticket arrives mentioning "switchover," the Orchestrator
+already knows — before calling a single agent — that this apparently local
+change potentially crosses five technical domains. **That's difficult for
+a generic coding agent with a big context window to reconstruct from
+scratch on every single ticket.**
+
+Every resolved ticket writes back into the Knowledge Graph (§5):
+
+- New `depends_on` edges discovered during impact analysis
+- New `must_approve` edges learned from who actually signed off
+- Updated `confidence` scores on existing edges that were confirmed or
+  contradicted by this ticket's outcome
+- New `Decision` nodes linking the resulting PR back to the rationale
+
+This means the system's answer to "who needs to be involved" gets
+**structurally better with every ticket**, not just "more data for
+retrieval." A competitor starting today has to rebuild this graph from
+zero; a customer running this for a year has a graph a competitor cannot
+buy or scrape.
+
+---
+
+## 12. Phased Rollout
+
+Deliberately **not** starting with autonomous code changes. The first
+question that must be answered is the Core Thesis (§3) — until specialized
+agent collaboration is proven to beat a single strong agent, building
+Phase 2/3 is premature.
+
+### Phase 1 — Investigation & Impact Analysis (MVP)
+
+```
+Ticket → investigation → cross-team impact analysis → root cause →
+recommended fix (written up, NOT auto-applied)
+```
+
+Success metric: triage quality and speed vs. a human on-call engineer,
+and vs. a single large-context-window coding agent given the same ticket
+and full repo access.
+
+### Phase 2 — Draft Changes
+
+```
+Phase 1 output → branch + tests + draft PR (human merges)
+```
+
+Only after Phase 1 demonstrates that cross-agent impact analysis catches
+things a single agent misses (the actual differentiator to prove).
+
+### Phase 3 — Autonomous Remediation
+
+```
+Phase 2 output → auto-merge for low-risk, high-confidence changes →
+human review only for the escalated subset
+```
+
+Gated behind sustained Phase 2 accuracy in production.
+
+---
+
+## 13. The Killer Demo
+
+The demo is not "we have an AI that knows your docs." It's watching a
+ticket get triaged by a live network of specialists, with a visible
+timeline of who talked to whom and why.
+
+```
+13:42:01  Ticket received
+
+13:42:08  Cluster Linking Agent claims ticket
+
+13:42:21  → asks KRaft Agent about metadata transition
+
+13:42:27  → asks Producer Agent about rebootstrap
+
+13:42:31  → asks Consumer Agent about offset behavior
+
+13:42:44  Agents identify shared codepath
+
+13:43:12  Root cause identified
+
+13:44:05  Regression test generated
+
+13:45:19  PR opened
+
+13:45:22  Ticket updated with:
+          - root cause
+          - affected components
+          - evidence
+          - PR
+          - unresolved questions
+```
+
+Every line in that timeline corresponds to a real, typed message in the
+protocol from §6 — not a scripted narration. The demo should be able to
+show the raw `ImpactRequest`/`ImpactResponse` JSON behind any line on
+request, because that auditability is the product.
+
+---
+
+## 14. Repository Layout
 
 ```
 log-analytics-copilot/
 │
 ├── proto/
-│   ├── logs.proto              # LogEvent + LogIngestionService (existing)
-│   └── sme_agents.proto        # Generic SME agent + Orchestrator RPCs
+│   ├── logs.proto               # LogEvent + LogIngestionService (existing)
+│   └── sme_agents.proto         # Ticket, Finding, ImpactRequest/Response,
+│                                 # Orchestrator + SMEAgent RPCs (§6)
+│
+├── knowledge-graph/
+│   ├── schema.sql                # entities + edges tables (§5)
+│   ├── ingest_github.py          # PRs, CODEOWNERS → ownership edges
+│   ├── ingest_traces.py          # trace_id co-occurrence → depends_on edges
+│   └── ingest_ticket_outcomes.py # resolved tickets → must_approve edges
 │
 ├── gateway/
-│   ├── main.py                 # FastAPI — external entry point
+│   ├── main.py                   # FastAPI — external entry point
 │   └── Dockerfile
 │
 ├── orchestrator/
-│   ├── main.py                 # gRPC server + agent registry
-│   ├── classifier.py           # LLM domain classifier
-│   ├── consultation.py         # Investigate → ConsultAbout loop
+│   ├── main.py                   # gRPC server + agent registry
+│   ├── classifier.py             # Knowledge-graph-driven domain classifier
+│   ├── consultation.py           # Investigate → ImpactRequest/Response loop
+│   ├── ownership_validator.py    # checks cited codepaths against §7 boundaries
 │   └── Dockerfile
 │
 ├── agents/
-│   ├── base_agent.py           # SMEAgentBase + @tool decorator
-│   ├── kora_global_agent.py    # Kora Global SME Agent
-│   ├── consumer_team_agent.py  # Consumer Team SME Agent
-│   ├── oss_kafka_agent.py      # OSS Kafka SME Agent
-│   ├── broker_team_agent.py    # Broker Team SME Agent (future)
-│   ├── billing_team_agent.py   # Billing Team SME Agent (future)
-│   └── Dockerfile              # shared — all agents use same image
+│   ├── base_agent.py             # SMEAgentBase + @tool decorator + 3-layer context (§4)
+│   ├── kora_global_agent.py
+│   ├── consumer_team_agent.py
+│   ├── oss_kafka_agent.py
+│   ├── broker_team_agent.py      # future
+│   ├── billing_team_agent.py     # future
+│   └── Dockerfile
+│
+├── runbooks/                     # persistent Domain Memory per agent (§4)
+│   ├── kora-global-sme.md
+│   ├── consumer-team-sme.md
+│   └── oss-kafka-sme.md
 │
 ├── mcp-server/
-│   ├── main.py                 # FastAPI MCP tool server (existing)
-│   ├── tools.py                # Tool implementations (existing)
+│   ├── main.py                   # FastAPI MCP tool server (existing)
+│   ├── tools.py                  # Tool implementations (existing)
 │   └── requirements.txt
 │
-├── spark/
-│   ├── kafka_to_delta.py       # Kafka → Bronze → Silver streaming (existing)
-│   ├── build_gold.py           # Silver → Gold error counts
-│   ├── build_token_index.py    # Silver → log_tokens keyword index
-│   └── build_service_graph.py  # Silver → service_graph (trace_id edges)  ← NEW
+├── log-pipeline/                 # ONE input source to the Knowledge Graph,
+│   ├── kafka_to_delta.py         # not the center of the architecture
+│   ├── build_service_graph.py    # trace_id → depends_on edges (feeds §5)
+│   └── ...
 │
-├── ingest-gateway/             # Go gRPC server + Kafka producer (Week 1)
-├── loadgen/                    # Go load generator (Week 1)
 ├── scripts/
 │   ├── kafka-smoke.sh
 │   ├── spark-smoke.sh
-│   ├── spark-submit.sh
-│   ├── produce-fake-logs.py
-│   └── _count_delta.py
+│   └── produce-fake-logs.py
 │
-├── checkpoints/                # Spark streaming checkpoints (gitignored)
-├── delta/                      # Delta table data (gitignored)
-├── diagrams/                   # Architecture diagrams
 ├── docker-compose.yml
 ├── README.md
-└── ARCHITECTURE.md             ← this file
+└── ARCHITECTURE.md               ← this file
 ```
 
 ---
 
-## 9. Data Schema
+## 15. Data Schema
 
 ### LogEvent (proto/logs.proto)
 
@@ -594,30 +792,40 @@ log-analytics-copilot/
 | `service` | string | Partition key in Silver table |
 | `level` | string | DEBUG / INFO / WARN / ERROR |
 | `message` | string | Free-form, tokenized for keyword index |
-| `trace_id` | string | Groups events across services — **the dependency graph key** |
+| `trace_id` | string | Groups events across services — feeds `depends_on` edges into the Knowledge Graph |
 | `event_id` | string | Unique per log line, used for dedup |
 | `host` | string | Originating host |
 
-### Delta Tables
+### Knowledge Graph tables (Postgres — see §5)
 
-| Table | Layer | Partition | Description |
-|---|---|---|---|
-| `bronze_logs` | Bronze | `ingest_date` | Raw JSON from Kafka, append-only |
-| `silver_logs` | Silver | `service / date / hour` | Parsed, deduped on `(trace_id, event_id)` |
-| `gold_error_counts` | Gold | `service / minute` | Per-minute error counts + top messages |
-| `log_tokens` | Gold | `service` | Token → event_id inverted index for keyword search |
-| `service_graph` | Gold | — | `(from_service, to_service, co_occurrences)` — live dependency graph |
+| Table | Description |
+|---|---|
+| `entities` | Services, repositories, codepaths, decisions, teams, rules |
+| `edges` | Typed relationships between entities, with evidence + confidence |
 
-### Finding (proto/sme_agents.proto)
+### Delta tables (log pipeline — one input source, see §9)
 
-Every SME agent returns this same shape. Fields are additive — agents only
-fill what they know.
+| Table | Layer | Description |
+|---|---|---|
+| `bronze_logs` | Bronze | Raw JSON from Kafka, append-only |
+| `silver_logs` | Silver | Parsed, deduped on `(trace_id, event_id)`, partitioned by service |
+| `service_graph` | Gold | `(from_service, to_service, co_occurrences)` — feeds Knowledge Graph `depends_on` edges |
+
+### Finding / ImpactResponse (proto/sme_agents.proto)
+
+Every SME agent returns these same shapes (§6). Fields are additive —
+agents only fill what they know, and `open_questions` is a first-class
+field for admitted uncertainty.
 
 ---
 
-## 10. Adding a New SME Agent
+## 16. Adding a New SME Agent
 
-1. Create `agents/my_team_agent.py`:
+1. Write a runbook in `runbooks/my-team-sme.md`: what the team owns, exact
+   repo paths/line ranges, what tools it needs (see existing runbooks for
+   the format).
+
+2. Create `agents/my_team_agent.py`:
 
 ```python
 from agents.base_agent import SMEAgentBase, tool
@@ -625,126 +833,107 @@ from agents.base_agent import SMEAgentBase, tool
 class MyTeamAgent(SMEAgentBase):
     AGENT_NAME = "my-team"
     DOMAIN     = "plain English description of what this team owns"
+    OWNS       = ["path/to/repo/", "another/owned/path/"]  # enforced by §7
 
     @tool("my_tool")
     async def my_tool(self, param: str) -> dict:
         """One-line description shown to Orchestrator's classifier."""
-        result = await self.mcp.query_logs(f"SELECT ... WHERE service='my-service'")
-        return result
-
-    @tool("another_tool")
-    async def another_tool(self, topic: str, partition: int) -> dict:
-        """Another domain-specific tool."""
-        ...
+        return await self.mcp.query_logs(f"SELECT ... WHERE service='my-service'")
 ```
 
-2. Add to `docker-compose.yml`:
+3. Add to `docker-compose.yml` and register with the Orchestrator on boot.
 
-```yaml
-my-team-agent:
-  build: ./agents
-  command: python -m agents.my_team_agent
-  environment:
-    - ORCHESTRATOR_ADDR=orchestrator:50050
-    - MCP_ADDR=mcp-server:8000
-```
-
-That's it. The agent self-registers with the Orchestrator on boot. No changes
-to proto, Orchestrator, or any other agent.
+Zero changes to proto, Orchestrator, or existing agents. The Knowledge Graph
+picks up the new `Team --owns--> Repository` edges from the runbook/manifest
+automatically.
 
 ---
 
-## 11. Docker Compose Services
-
-| Service | Image | Port | Role |
-|---|---|---|---|
-| `kafka` | `bitnamilegacy/kafka:3.7` | 9092 | Log stream broker (KRaft mode) |
-| `spark-master` | `bitnamilegacy/spark:3.5` | 8080, 7077 | Spark cluster master |
-| `spark-worker` | `bitnamilegacy/spark:3.5` | 8081 | Spark worker |
-| `mcp-server` | `python:3.12-slim` | 8000 | MCP tool server |
-| `gateway` | `python:3.12-slim` | 8080 | API Gateway (external entry) |
-| `orchestrator` | `python:3.12-slim` | 50050 | Orchestrator gRPC server |
-| `kora-global-agent` | `python:3.12-slim` | 50051 | Kora Global SME Agent |
-| `consumer-team-agent` | `python:3.12-slim` | 50052 | Consumer Team SME Agent |
-| `oss-kafka-agent` | `python:3.12-slim` | 50053 | OSS Kafka SME Agent |
-| `broker-team-agent` | `python:3.12-slim` | 50054 | Broker Team SME Agent |
-| `billing-team-agent` | `python:3.12-slim` | 50055 | Billing Team SME Agent |
-
----
-
-## 12. Build Roadmap
+## 17. Build Roadmap
 
 ### Phase 0 — Observability backbone (done)
-- [x] Kafka KRaft + Spark streaming
-- [x] Bronze + Silver Delta tables (real data written May 2026)
+- [x] Kafka KRaft + Spark streaming, Bronze/Silver Delta tables
 - [x] MCP server with 5 tools (`query_logs`, `top_errors`, `search_keyword`,
       `pipeline_status`, `optimize_table`)
 - [x] `proto/logs.proto` + `LogIngestionService`
+- [x] Three SME runbooks (`kora-global`, `consumer-team`, `oss-kafka`)
 
-### Phase 1 — SME Agent skeleton (Week 1)
-- [ ] `proto/sme_agents.proto` — generic types + RPCs
-- [ ] `agents/base_agent.py` — `SMEAgentBase` + `@tool` decorator
-- [ ] `orchestrator/main.py` — agent registry + `TriageTicket`
-- [ ] `gateway/main.py` — HTTP → gRPC translation
-- [ ] Wire `PySparkExecutor` replacing `StubSparkExecutor` in `tools.py`
+### Phase 1 — Knowledge Graph + typed protocol (Weeks 1–2)
+- [ ] `knowledge-graph/schema.sql` — entities + edges (§5)
+- [ ] `knowledge-graph/ingest_github.py` — CODEOWNERS + PR history → ownership edges
+- [ ] `proto/sme_agents.proto` — `Ticket`, `Finding`, `ImpactRequest/Response` (§6)
+- [ ] `orchestrator/ownership_validator.py` — enforce §7 boundaries
 
-### Phase 2 — First 3 SME Agents (Week 2)
-- [ ] `agents/consumer_team_agent.py` — richest domain, 4 tools
-- [ ] `agents/kora_global_agent.py` — 4 tools grounded in CL failover logs
-- [ ] `agents/oss_kafka_agent.py` — KIP search + protocol tools
-- [ ] Orchestrator consultation loop (Investigate → ConsultAbout)
+### Phase 2 — First 3 SME Agents (Weeks 3–4)
+- [ ] `agents/consumer_team_agent.py`, `kora_global_agent.py`, `oss_kafka_agent.py`
+- [ ] Orchestrator consultation loop using the typed protocol
+- [ ] Knowledge-graph-driven classifier (replace keyword-only routing)
 
-### Phase 3 — Dependency graph + blast radius (Week 3)
-- [ ] `spark/build_service_graph.py` — mine `trace_id` edges into `service_graph`
-- [ ] MCP tools: `blast_radius` + `dependency_graph`
-- [ ] Orchestrator uses graph to pre-classify ticket domains
+### Phase 3 — Prove the Core Thesis (Week 5)
+- [ ] Run the same 10–20 real tickets through: (a) this multi-agent system,
+      (b) a single large-context-window agent with full repo access
+- [ ] Compare: root cause accuracy, cross-team impact catches, time to answer
+- [ ] **Decision point** — proceed to Phase 2 rollout (§12) only if the
+      multi-agent system wins on impact-catch rate
 
-### Phase 4 — Full demo (Week 4)
-- [ ] End-to-end: POST a ticket → stream findings → `TriageResult`
-- [ ] `broker-team-agent` + `billing-team-agent`
-- [ ] Autonomous PR drafting (GitHub API) when `requires_human=false`
-- [ ] Consumer groups per topic example works end-to-end
+### Phase 4 — Draft PRs (Phase 2 rollout, §12)
+- [ ] Fix Planner + Code Agent + Test Agent
+- [ ] Consumer-groups-per-topic example produces an actual draft PR
 
 ---
 
-## 13. Design Decisions
+## 18. Design Decisions
 
-### Why gRPC between agents, not HTTP?
+### Why typed agent-to-agent protocol, not free-form chat?
 
-Agents need streaming responses (findings arrive incrementally as tools run),
-typed contracts (a `Finding` must have specific fields), and low latency
-(consultation chains can be 3–4 hops deep). gRPC handles all three.
-HTTP/JSON works for the external API gateway because webhooks expect it.
+Free-form LLM-to-LLM chat compounds interpretation errors with every hop —
+by the third agent in a chain, claims have drifted from evidence into
+paraphrase. A typed `ImpactRequest`/`ImpactResponse` (§6) forces every
+agent to commit to structured, falsifiable claims (`affected_components`,
+`confidence`, `open_questions`) that the Orchestrator can validate against
+the Knowledge Graph before trusting them.
 
-### Why MCP for tools, not gRPC?
+### Why a Postgres knowledge graph, not a vector database?
 
-MCP is HTTP-native and designed for LLM tool use — it's discoverable (the
-manifest endpoint), simple to add tools to, and already integrated with the
-log analytics backbone. Agent-to-agent communication is gRPC because it needs
-typing and streaming. Tool calls are MCP because they're request-response and
-the MCP server is already built.
+"Who owns this," "what does this block," "what must approve this change"
+are graph traversal questions, not similarity-search questions. A vector
+DB answers "what text looks similar to this text" — it cannot answer "what
+is the shortest dependency chain between switchover and EOS transactions."
+Postgres with an entities/edges schema is boring, cheap, and answers the
+actual questions this product needs to answer. Move to a dedicated graph
+DB only if query complexity outgrows SQL joins.
 
-### Why one generic proto, not one per agent?
+### Why explicit ownership boundaries, not "all agents know everything"?
 
-If each agent had its own proto, adding an agent requires touching the proto
-layer and potentially the Orchestrator. With a generic proto, `Finding` carries
-everything any agent could return — the `tool_results` field is a list of
-`ToolResult` where the result field is JSON (each tool owns its shape). New
-agents add zero new proto types.
+Without boundaries, every agent is tempted to guess about code it doesn't
+own — which is exactly the failure mode of a single big-context-window
+agent (confidently wrong about unfamiliar code). Enforcing that an agent
+must issue a typed request to the owning agent, rather than answer from a
+guess, is what makes the network's aggregate answer more reliable than
+any one agent's guess — but only if the boundary is enforced by the
+Orchestrator, not left as a prompt suggestion.
 
-### Why is `trace_id` the dependency graph key?
+### Why gRPC between agents, MCP for tools?
 
-`trace_id` is already in every `LogEvent`. When the same `trace_id` appears
-in logs from `payments-service` AND `auth-service`, a real cross-service
-request happened. Mining these co-occurrences gives a dependency graph that
-is: (a) derived from actual traffic, not documentation; (b) always up to date
-as long as logs flow; (c) weighted by volume (high co-occurrence = strong
-dependency). No human writes or maintains it.
+Agents need typed contracts and streaming (consultation chains can be
+3–4 hops deep) — gRPC handles both. Tool calls are request-response and
+already built on MCP (HTTP-native, discoverable via the manifest endpoint).
+These are different layers and should not be conflated.
 
-### Why not one big agent?
+### Why is the log pipeline a peripheral input, not the center?
 
-A single agent with all domain knowledge would: (a) have a bloated context
-window, (b) produce lower-quality answers because it can't specialize,
-(c) not model the real approval structure (Consumer Team lead != Billing Team
-lead), and (d) not scale — adding a new domain shouldn't require retraining
-or changing a monolith. The network of specialists mirrors the real org.
+Earlier versions of this project treated Kafka/Spark/Delta as the core
+architecture. It is useful — `trace_id` co-occurrence is one legitimate
+source of `depends_on` edges — but it is one ingestion pipeline among
+several (GitHub, Jira, Slack, static analysis). The Knowledge Graph (§5)
+and the typed agent protocol (§6) are the actual product; log ingestion is
+plumbing that feeds evidence into it.
+
+### Why not start with autonomous code changes?
+
+Because the fundamental hypothesis (§3) — that specialized agents with
+ownership boundaries and typed communication beat one strong generalist
+agent — has not been proven yet. Building auto-merge PR generation before
+proving that hypothesis risks building an elaborate architecture that a
+simpler system would have matched. Phase 1 exists specifically to falsify
+or confirm this before further investment.
