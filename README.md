@@ -10,44 +10,25 @@ Specialized engineering agents that pick up a ticket, figure out which teams are
 
 **[▶ Watch the demo (video)](https://github.com/Ccolina03/long-analytic-copilot-mcp/blob/main/log-analytics-copilot/demo/sme-network-demo.webm)**
 
+Or run it locally:
+
 ```bash
-python -m pytest -q
-python -m api.main                    # http://127.0.0.1:8080
-cd web && npm install && npm run dev  # http://localhost:3000
+cd log-analytics-copilot
+python -m api.main                    # API on :8080
+cd web && npm install && npm run dev  # UI on :3000
 ```
 
 Open http://localhost:3000 → **Watch recorded demo** (or **Run live**).
 
-## How it works
+## How it works (short)
 
 1. **Jira intake** — ticket routes to the owning SME  
 2. **Discovery** — consult who owns the blast radius, skip everyone else  
 3. **Deliberation** — peers answer across the mesh  
-4. **1-pager** — decision brief with consulted / skipped  
+4. **1-pager** — decision brief with who was consulted and who was skipped  
 
-## Jira
+Jira webhook: `POST /api/webhooks/jira` (details in [`log-analytics-copilot/README.md`](log-analytics-copilot/README.md)).
 
-```
-POST /api/webhooks/jira
-```
+## Project layout
 
-Labels/components map to an SME team (`mirrormaker`, `group-coordinator`, `kafka-broker`, `kafka-clients`, `kafka-security`). See `api/main.py` for the payload shape.
-
-## Deploy
-
-| Piece | Host |
-|-------|------|
-| `web/` | Vercel |
-| `api/` | Render / Fly / Railway |
-
-Set `API_URL` for the Next.js rewrite in `web/next.config.ts`.
-
-## Layout
-
-```
-agents/   SME agents, discovery, tracing
-api/      FastAPI + Jira webhook
-web/      mesh UI
-demo/     recorded walkthrough video
-runbooks/ architecture + CODEOWNERS
-```
+Code lives under [`log-analytics-copilot/`](log-analytics-copilot/).
