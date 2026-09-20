@@ -3,6 +3,7 @@
 export type Beat = {
   id: string;
   step: string;
+  label: string;
   title: string;
   line: string;
 };
@@ -10,51 +11,61 @@ export type Beat = {
 export const BEATS: Beat[] = [
   {
     id: "intake",
-    step: "01",
+    step: "1",
+    label: "Intake",
     title: "A Jira ticket lands",
     line: "Routed to the owning SME — no central orchestrator.",
   },
   {
     id: "investigate",
-    step: "02",
-    title: "Owner investigates",
+    step: "2",
+    label: "Investigate",
+    title: "Owner digs in",
     line: "MirrorMaker reads runbooks, forms findings, maps blast radius.",
   },
   {
     id: "discover",
-    step: "03",
-    title: "Discover who to bring in",
+    step: "3",
+    label: "Discover",
+    title: "Who enters the room",
     line: "Consult teams that own the impact. Skip everyone else.",
   },
   {
     id: "deliberate",
-    step: "04",
+    step: "4",
+    label: "Deliberate",
     title: "Peers talk on the mesh",
-    line: "Asks and replies fly between specialists until the design holds.",
+    line: "Asks and replies fly until the design holds.",
   },
   {
     id: "decide",
-    step: "05",
+    step: "5",
+    label: "Decide",
     title: "Land the 1-pager",
     line: "Decision brief: consulted, skipped, recommendation.",
   },
 ];
 
+/** How long each step banner stays on screen (in + hold + out). */
+export const BEAT_MS = 2800;
+
 type Props = {
   beat: Beat | null;
 };
 
-/** Lower-third caption — demo keeps running underneath. */
+/** Step transition — appears, holds, disappears over the live demo. */
 export default function BeatCaption({ beat }: Props) {
   if (!beat) return null;
   return (
-    <div className="beat-caption" key={beat.id} role="status">
-      <div className="beat-caption-inner">
-        <span className="beat-step">{beat.step}</span>
-        <div className="beat-copy">
-          <div className="beat-title">{beat.title}</div>
-          <div className="beat-line">{beat.line}</div>
+    <div className="beat-stage" key={beat.id} role="status" aria-live="polite">
+      <div className="beat-banner">
+        <div className="beat-banner-kicker">
+          <span className="beat-banner-step">Step {beat.step}</span>
+          <span className="beat-banner-label">{beat.label}</span>
         </div>
+        <h2 className="beat-banner-title">{beat.title}</h2>
+        <p className="beat-banner-line">{beat.line}</p>
+        <div className="beat-banner-progress" aria-hidden />
       </div>
     </div>
   );

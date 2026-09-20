@@ -27,15 +27,13 @@ import JiraTicket from "@/components/JiraTicket";
 import Spotlight from "@/components/Spotlight";
 import Finale from "@/components/Finale";
 import BeatCaption, {
+  BEAT_MS,
   beatForEvent,
   demoEvents,
   type Beat,
 } from "@/components/BeatCaption";
 
 type Tab = "event" | "doc";
-
-/** Caption stays up while the mesh keeps moving (~2.4s). */
-const BEAT_HOLD_MS = 2400;
 
 async function startDemo(): Promise<string> {
   const resp = await fetch("/api/demo", { method: "POST" });
@@ -83,12 +81,10 @@ function replay(
   const events = demo ? demoEvents(trace.events) : trace.events;
   let i = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  let beatTimer: ReturnType<typeof setTimeout> | undefined;
   const seen = new Set<string>();
 
   const clear = () => {
     if (timer) clearTimeout(timer);
-    if (beatTimer) clearTimeout(beatTimer);
   };
 
   const tick = () => {
@@ -98,19 +94,22 @@ function replay(
       return;
     }
     const e = events[i];
-    onEvent(e);
+    const beat = demo ? beatForEvent(e, seen) : null;
 
-    if (demo) {
-      const beat = beatForEvent(e, seen);
-      if (beat) {
-        onBeat(beat);
-        if (beatTimer) clearTimeout(beatTimer);
-        beatTimer = setTimeout(() => onBeat(null), BEAT_HOLD_MS);
-      }
+    const advance = () => {
+      onBeat(null);
+      onEvent(e);
+      i += 1;
+      timer = setTimeout(tick, events[i] ? delayFor(e.kind, demo) : 80);
+    };
+
+    if (beat) {
+      // Pause on the step banner so it can appear → hold → disappear on camera
+      onBeat(beat);
+      timer = setTimeout(advance, BEAT_MS);
+    } else {
+      advance();
     }
-
-    i += 1;
-    timer = setTimeout(tick, events[i] ? delayFor(e.kind, demo) : 80);
   };
 
   tick();
@@ -162,7 +161,7 @@ export default function Page() {
     stopMusic();
     const a = new Audio("/demo-music.mp3");
     a.loop = false;
-    a.volume = 0.35;
+    a.volume = 0.55;
     musicRef.current = a;
     void a.play().catch(() => {
       /* autoplay may be blocked outside the demo click path */
