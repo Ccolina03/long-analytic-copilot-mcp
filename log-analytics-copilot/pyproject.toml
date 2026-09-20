@@ -2,6 +2,7 @@
 testpaths = [
     "knowledge_graph/tests",
     "agents/tests",
+    "llm/tests",
     "router/tests",
     "tests/integration",
 ]

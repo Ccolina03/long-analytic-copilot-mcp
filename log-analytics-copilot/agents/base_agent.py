@@ -54,7 +54,10 @@ from __future__ import annotations
 
 import functools
 import logging
-from typing import Any, Callable
+from typing import TYPE_CHECKING, Any, Callable
+
+if TYPE_CHECKING:
+    from llm.client import AgentLLM
 
 from proto.sme_agents import (
     DeliberationRound,
@@ -208,16 +211,115 @@ class SMEAgentBase:
     MAX_DELIBERATION_ROUNDS: int = 3
     MAX_CONSULTATION_DEPTH: int = 3
 
-    def __init__(self, transport: PeerTransport | None = None, kg_conn: Any = None):
+    # Capability tier this agent needs for its routine reasoning.  The router
+    # resolves it to the cheapest available model (see llm/registry.py).
+    # Most work is cheap; agents escalate to LLM_DESIGN_TIER only for the
+    # design-review calls where reasoning quality actually changes the output.
+    LLM_TIER: str = "small"
+    LLM_DESIGN_TIER: str = "deep"
+
+    def __init__(
+        self,
+        transport: PeerTransport | None = None,
+        kg_conn: Any = None,
+        llm: "AgentLLM | None" = None,
+    ):
         """
         Args:
             transport:  peer transport used for outbound consultations.
                         Defaults to NullTransport.
             kg_conn:    Knowledge Graph database connection.  If None, a
                         fresh connection is opened via ``db.get_connection()``.
+            llm:        Optional LLM handle.  When None, one is created lazily
+                        from the environment; if nothing is configured it
+                        resolves to "no model" and every agent falls back to
+                        its deterministic authored content at zero cost.
         """
         self._transport = transport or NullTransport()
         self._kg_conn = kg_conn
+        self._llm = llm
+        self._llm_initialized = llm is not None
+
+    # ------------------------------------------------------------------
+    # LLM access
+    # ------------------------------------------------------------------
+
+    @property
+    def llm(self) -> "AgentLLM":
+        """This agent's LLM handle, created on first use."""
+        if not self._llm_initialized:
+            from llm.client import AgentLLM
+            self._llm = AgentLLM(agent_id=self.AGENT_NAME, tier=self.LLM_TIER)
+            self._llm_initialized = True
+        return self._llm
+
+    def attach_budget(self, budget: Any) -> None:
+        """Attach a ``TicketBudget`` so this agent's spend is attributed."""
+        self.llm.budget = budget
+
+    @property
+    def llm_enabled(self) -> bool:
+        """True when a real model is available; False means authored fallback."""
+        try:
+            return self.llm.enabled
+        except Exception:
+            return False
+
+    def _role_prompt(self) -> str:
+        """The system prompt establishing who this agent is.
+
+        Stable across every call, so it sits at the front of the prompt where
+        provider prompt caches can match on it.
+        """
+        owns = "\n".join(f"  - {p}" for p in self.OWNS) or "  (none declared)"
+        tools = ", ".join(sorted(self.get_tools().keys())) or "none"
+        return (
+            f"You are the SME agent for the {self.AGENT_NAME} team.\n"
+            f"Domain: {self.DOMAIN}\n\n"
+            f"You are authoritative over exactly these codepaths:\n{owns}\n\n"
+            f"Tools whose output you have been given: {tools}\n\n"
+            "You are a principal engineer. Rules you must follow:\n"
+            "1. Only make claims about code you own. For anything outside your\n"
+            "   ownership, say it needs verification by the owning team.\n"
+            "2. Ground every claim in the tool output you were given. Do not\n"
+            "   invent file paths, metrics, or version numbers.\n"
+            "3. When you disagree with a proposal, say so directly and explain\n"
+            "   the concrete failure mode. Agreement you do not mean is worse\n"
+            "   than useless.\n"
+            "4. Escalate to a human only for decisions that require\n"
+            "   organizational authority (an external vote, a budget, an SLA\n"
+            "   change). Never escalate because a technical question is hard."
+        )
+
+    def _llm_text(
+        self,
+        *,
+        question: str,
+        stable_context: str = "",
+        volatile_context: str = "",
+        purpose: str = "",
+        tier: str | None = None,
+    ) -> str | None:
+        """Ask this agent's model for prose. ``None`` means use the fallback.
+
+        Never raises: a provider outage or an exhausted budget degrades the
+        output to authored content rather than failing the ticket.
+        """
+        try:
+            return self.llm.reason(
+                role_prompt=self._role_prompt(),
+                stable_context=stable_context,
+                volatile_context=volatile_context,
+                question=question,
+                purpose=purpose,
+                tier=tier,
+            )
+        except Exception:
+            logger.warning(
+                "[%s] LLM unavailable for %r; using authored fallback",
+                self.AGENT_NAME, purpose or question[:40], exc_info=True,
+            )
+            return None
 
     # ------------------------------------------------------------------
     # Tool registry
@@ -358,6 +460,12 @@ class SMEAgentBase:
 
         response = self._handle_consultation(request, depth)
 
+        # If a model is configured, let it sharpen the review prose. The
+        # authored review stays as the fallback and as the grounding context,
+        # so this can only add detail — it cannot silently replace a
+        # tool-grounded verdict with a hallucinated one.
+        self._maybe_enrich_review(response, request)
+
         # Self-validate citations before sending
         from agents.ownership_validator import validate_citations  # noqa: PLC0415
         validation = validate_citations(response.cited_codepaths, self.OWNS)
@@ -369,6 +477,68 @@ class SMEAgentBase:
             )
 
         return response
+
+    # ------------------------------------------------------------------
+    # LLM enrichment of deliberation output
+    # ------------------------------------------------------------------
+
+    def _maybe_enrich_review(
+        self, response: ImpactResponse, request: ImpactRequest
+    ) -> None:
+        """Deepen ``response.principal_review`` using the model, in place.
+
+        Deliberately *additive*. The verdict, alternatives, and cited codepaths
+        are all derived from deterministic tool output and are never overwritten
+        here — only the review narrative is. That keeps the parts a reviewer
+        relies on grounded, while still getting better prose when a model is
+        available. A no-op when no model is configured.
+        """
+        if not self.llm_enabled:
+            return
+
+        authored = response.principal_review or response.summary
+        alternatives = "\n".join(
+            f"  {a.label}. {a.name} (effort={a.effort}, risk={a.risk})\n"
+            f"     {a.approach}"
+            for a in request.alternatives_on_table
+        ) or "  (none proposed yet)"
+
+        # Split so the cache-stable half (role, ownership, ticket) is separate
+        # from the per-round half. Across 3 rounds this is most of the tokens.
+        stable = (
+            f"Ticket context:\n{request.context}\n\n"
+            f"Codepaths you were asked about: "
+            f"{', '.join(request.codepaths_of_interest) or 'your domain generally'}"
+        )
+        volatile = (
+            f"This is deliberation round {request.round_number}.\n\n"
+            f"Alternatives currently on the table:\n{alternatives}\n\n"
+            f"Concerns already raised by other teams:\n"
+            + ("\n".join(f"  - {c}" for c in request.prior_concerns) or "  (none)")
+            + f"\n\nYour own analysis, derived from your tools:\n{authored}\n\n"
+            f"Your verdict, already decided from tool output: {response.verdict}"
+        )
+
+        enriched = self._llm_text(
+            stable_context=stable,
+            volatile_context=volatile,
+            question=(
+                f"{request.question}\n\n"
+                "Expand your analysis above into a principal-engineer review of "
+                "2-4 paragraphs. Be specific about failure modes and name the "
+                "codepaths you own that are affected. Do not change the verdict "
+                "and do not introduce facts absent from the analysis above."
+            ),
+            purpose=f"principal_review:round{request.round_number}",
+            tier=self.LLM_DESIGN_TIER,
+        )
+
+        if enriched:
+            response.principal_review = enriched
+            logger.info(
+                "[%s] principal_review enriched by %s",
+                self.AGENT_NAME, self.llm.describe(),
+            )
 
     # ------------------------------------------------------------------
     # Deliberation mechanics

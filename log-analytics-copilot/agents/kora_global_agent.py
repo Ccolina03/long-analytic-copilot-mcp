@@ -49,6 +49,10 @@ class KoraGlobalAgent(SMEAgentBase):
         "LinkHealthMonitor.java",
     ]
 
+    # As the owning agent this one authors the 1-pager and synthesizes three
+    # teams' input, so it carries a standard tier rather than the cheapest.
+    LLM_TIER = "standard"
+
     # Latency target that any acceptable alternative must hit
     TARGET_CLAMP_P99_MS = 50
 

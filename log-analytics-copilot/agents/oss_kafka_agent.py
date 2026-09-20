@@ -41,6 +41,11 @@ class OssKafkaAgent(SMEAgentBase):
         "apache/kafka/core/src/main/scala/kafka/server/KafkaApis.scala",
     ]
 
+    # Wire-protocol compatibility reasoning is the highest-stakes judgment in
+    # this network: get it wrong and you ship a breaking change to every Kafka
+    # client. Worth a strong model on every call, not just design review.
+    LLM_TIER = "deep"
+
     # ------------------------------------------------------------------
     # Tools
     # ------------------------------------------------------------------

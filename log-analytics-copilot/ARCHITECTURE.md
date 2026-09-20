@@ -1553,3 +1553,161 @@ Before merging any change that touches a given phase's code:
       `runbooks/` is updated to match — the runbook and the code must
       never drift apart, since it's the source of truth the Knowledge
       Graph and every other agent rely on
+
+---
+
+# Part X — Model Selection and Cost
+
+## 30. Why Agents Pick Their Own Model
+
+A network of specialized agents deliberating over three rounds could easily
+become the most expensive way ever devised to answer a bug report. Three agents
+× three rounds × a frontier model per call is how you end up paying more per
+ticket than the engineer would have cost. So model choice is a first-class
+architectural concern here, not a configuration detail.
+
+The thing that makes this tractable is a property of the design we already
+have: **an SME agent's tools are deterministic API calls, not model calls.**
+When the consumer-team agent computes the memory cost of a topic→group index,
+that is arithmetic over real cluster data. When the oss-kafka agent checks
+whether `ListGroupsRequest` v6 is wire-compatible, it reads an actual schema
+file. None of that consumes a token, and none of it can be hallucinated.
+
+The model is only needed for judgment:
+
+| Work | Needs a model? | Tier |
+|---|---|---|
+| Running a tool (memory estimate, KIP search, schema diff) | No — deterministic | — |
+| Deciding which tool to call | Yes, barely | `nano` |
+| Summarizing tool output into a verdict | Yes | `small` |
+| Writing a consultation response | Yes | `standard` |
+| Authoring design alternatives, arguing against a peer's proposal | Yes, and quality shows | `deep` |
+
+Because the expensive tier is also the rarest, total spend stays small while
+the calls that actually determine output quality still get a capable model.
+
+## 31. Tiers, Not Model Names
+
+Agents declare a *capability tier*. They never name a model:
+
+```python
+class OssKafkaAgent(SMEAgentBase):
+    LLM_TIER = "deep"          # wire-compat reasoning is the riskiest call here
+
+class ConsumerTeamAgent(SMEAgentBase):
+    LLM_TIER = "small"         # routine work is arithmetic over tool output
+    # LLM_DESIGN_TIER = "deep" is inherited — design review escalates per call
+```
+
+`llm/router.py` resolves a tier to the cheapest model available in the current
+environment. Three consequences worth stating:
+
+1. **Model choice becomes a deployment decision.** Swapping the whole org onto
+   a different provider is an environment change, not a code change.
+2. **Agents are honest about what they need.** `oss-kafka` is on `deep`
+   because shipping a breaking protocol change to every Kafka client is the
+   worst failure mode in the system. `consumer-team` is on `small` because its
+   routine output is a memory calculation. That asymmetry is deliberate and
+   reviewable.
+3. **Cheap by default, strong where it pays.** `LLM_DESIGN_TIER` lets a
+   `small`-tier agent escalate to `deep` for the single design-review call
+   that justifies the cost, rather than paying for depth on every call.
+
+## 32. Running at Zero Cost
+
+The default configuration costs nothing, because there isn't one. With no keys
+and no local model, the router resolves to `NullLLM`, every agent falls back to
+its deterministic authored content, and the full deliberation still runs and
+still produces a complete 1-pager.
+
+Three ways to run free, in increasing order of quality:
+
+```bash
+# 1. Nothing configured — authored content, $0.00, works offline
+python -m llm.cli
+
+# 2. Free local models via Ollama — real reasoning, $0.00, no rate limit
+brew install ollama && ollama serve &
+ollama pull qwen2.5:14b          # nano/small/standard tiers
+ollama pull deepseek-r1:32b      # deep tier
+
+# 3. Free hosted tiers — faster and stronger than local
+export GROQ_API_KEY=...                  # ~14,400 requests/day free
+export GEMINI_API_KEY=... SME_LLM_GEMINI_FREE_TIER=1   # ~1,500 requests/day
+```
+
+Paid, for reference: the whole three-agent deliberation on Groq's cheapest
+models at each tier costs about **$0.009 per ticket**, or $8.89 per thousand
+tickets. Per-ticket LLM cost is not the constraint on this business.
+
+## 33. Cost Controls
+
+All of these are environment variables — no code change, no redeploy:
+
+| Variable | Effect |
+|---|---|
+| `SME_LLM_PREFER_FREE` | Prefer $0.00 models over cheap paid ones (default on) |
+| `SME_LLM_MAX_COST_PER_MTOK` | Hard ceiling; models above it are never selected |
+| `SME_LLM_TIER_<agent>` | Override one agent's tier, up or down |
+| `SME_LLM_MODEL_<agent>` | Pin one agent to an exact `provider/model` |
+| `SME_LLM_DISABLE` | Force authored fallback everywhere |
+
+`SME_LLM_TIER_<agent>` is the interesting one for the hypothesis in §28. It
+lets you run the same ticket with the whole org downgraded to `nano` and
+measure how much output quality actually degrades. If a 8B model produces an
+acceptable 1-pager, that is worth knowing — and if it doesn't, you have
+evidence for where model quality genuinely matters rather than an assumption.
+
+`llm/budget.py` enforces a per-ticket ceiling (default $0.50, deliberately far
+above the ~$0.009 expected spend so it only trips on a genuine runaway) and
+attributes every call to an agent, a tier, and a purpose:
+
+```
+Ticket KAFKA-18231: 6 LLM calls, $0.0089 of $0.50 budget
+  tokens: 24,000 in (71% cached) / 4,200 out
+  by agent:
+    oss-kafka            $0.0058
+    kora-global          $0.0020
+    consumer-team        $0.0010
+  by tier:
+    deep                 $0.0078
+    small                $0.0010
+```
+
+## 34. Prompt Caching Is Load-Bearing
+
+Multi-round deliberation resends the same material every round: the agent's
+role, its ownership list, its runbook, the ticket. Only the round's question
+changes. That is precisely the shape prompt caching rewards, and the effect is
+large — DeepSeek bills a cache hit at $0.003/M against $0.15/M for a miss, a
+50× difference.
+
+So `build_messages()` in `llm/provider.py` orders prompts to make the prefix
+stable: role and ticket context go in the system message, per-round feedback
+and the question go in the user message. Rounds 2 and 3 then hit the cache on
+the bulk of their input tokens. `TicketBudget.cache_hit_rate` reports whether
+this is actually working; a low rate means something is leaking volatile
+content into the prefix, and there is a test asserting the system message is
+byte-identical across rounds to catch that regression.
+
+## 35. Failure Is Not Allowed to Be Fatal
+
+`AgentLLM.reason()` never raises and never propagates a provider error. It
+returns `None`, and `None` means "use your authored content." A provider
+outage, a rate limit, a malformed response, or an exhausted budget all degrade
+output quality without failing the ticket.
+
+This is the most important invariant in this part of the system, and it is
+tested directly: `agents/tests/test_agent_llm_integration.py` runs the same
+ticket through the network three ways — with a working model, with no model,
+and with a provider that raises on every call — and asserts the resulting
+design docs are *structurally identical*. Same alternatives, same
+recommendation, same round count, same teams, same human-escalation decision.
+Only the prose depth differs.
+
+That property is what keeps the model an upgrade rather than a dependency. The
+verdicts, cited codepaths, design alternatives, and the `needs_org_authority`
+flag are all derived from deterministic tool output, and LLM enrichment is
+explicitly forbidden from overwriting them. A model can make the review read
+better; it cannot invent a reason to page a human, and it cannot quietly
+replace a tool-grounded verdict with a plausible-sounding wrong one.

@@ -45,6 +45,11 @@ class ConsumerTeamAgent(SMEAgentBase):
         "TopicPartitionGroupIndex.java",
     ]
 
+    # Routine work (memory estimates, rebalance history) is arithmetic over
+    # tool output and needs no model depth; the design review that argues
+    # against a peer's proposal escalates to LLM_DESIGN_TIER on its own.
+    LLM_TIER = "small"
+
     # ------------------------------------------------------------------
     # Tools
     # ------------------------------------------------------------------
