@@ -1,23 +1,24 @@
 """
-Phase 6 — Full multi-agent integration test (mocked peers, no Docker needed).
+Phase 6 — Full multi-agent integration test.
 
-This is the single most important test in the plan (§25).  It replays the
-entire Part V walkthrough for real, with real agents running their real code,
-but uses MockTransport so no Docker/gRPC infrastructure is required.
+Replays the entire Part V walkthrough with all three real agents running their
+real code via DirectTransport (no gRPC server, no Docker needed).
 
 What it proves
 --------------
-1. kora-global receives the ticket and drives investigation itself.
-2. kora-global consults consumer-team on its own initiative (Knowledge Graph lookup).
-3. consumer-team consults oss-kafka on its own initiative (not pre-selected by kora).
-4. The final Finding has the correct 5-step execution_order from §11.
-5. approvals_needed includes both team leads.
-6. requires_human is True.
-7. Every codepath cited by kora-global in its Finding passes ownership
-   self-validation (no unflagged out-of-bounds citations).
+1. kora-global receives the ticket and drives the investigation itself.
+2. It proposes three genuinely distinct design alternatives before consulting.
+3. It deliberates with consumer-team and oss-kafka over multiple rounds.
+4. consumer-team consults oss-kafka on its own initiative — kora never asked.
+5. consumer-team pushes back substantively, correcting alternative B on a real
+   correctness point rather than rubber-stamping.
+6. The agents converge on a recommendation themselves.
+7. requires_human is True for exactly one reason — the Apache PMC vote — and
+   is decided only at the end, not mid-deliberation.
+8. Every codepath every agent cites passes that agent's ownership validation.
+9. The final artifact renders as a complete 1-page engineering design doc.
 
-This test is the permanent regression guard for the whole system.  Once
-it's green, CI must keep it green.
+This test is the permanent regression guard for the whole system.
 """
 
 from __future__ import annotations
@@ -27,71 +28,33 @@ import pathlib
 
 import pytest
 
-from agents.base_agent import MockTransport
+from agents.base_agent import DirectTransport
 from agents.consumer_team_agent import ConsumerTeamAgent
+from agents.design_doc import render_one_pager
 from agents.kora_global_agent import KoraGlobalAgent
 from agents.oss_kafka_agent import OssKafkaAgent
 from agents.ownership_validator import validate_citations
-from proto.sme_agents import ImpactRequest, ImpactResponse, Ticket
+from proto.sme_agents import Ticket
 
 _FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 
 # ---------------------------------------------------------------------------
-# Build a realistic multi-agent network using MockTransport
-#
-# Architecture:
-#   kora_agent  --consults-->  consumer_agent  --consults-->  oss_agent
-#
-# consumer_agent's MockTransport is pre-loaded with oss_agent's real response.
-# kora_agent's MockTransport is pre-loaded with consumer_agent's real response.
-#
-# This means each agent runs its _real_ _handle_consultation() code; only the
-# outbound transport hop is mocked (because there's no gRPC server in this test).
+# The real agent network — every agent runs its real code
 # ---------------------------------------------------------------------------
 
 @pytest.fixture(scope="module")
-def oss_agent():
-    return OssKafkaAgent()
-
-
-@pytest.fixture(scope="module")
-def consumer_agent(oss_agent):
-    """Consumer team agent wired so it can actually reach oss-kafka."""
-    # Build a transport that calls oss_agent.consult_about() directly
-    class DirectTransport:
-        def __init__(self, oss):
-            self._oss = oss
-
-        def consult(self, peer_id: str, request: ImpactRequest) -> ImpactResponse:
-            if peer_id == "oss-kafka":
-                return self._oss.consult_about(request, depth=request.consultation_depth)
-            return ImpactResponse(
-                request_id=request.request_id,
-                from_agent=peer_id,
-                to_agent=request.from_agent,
-                verdict="unknown",
-                timed_out=True,
-            )
-
-    return ConsumerTeamAgent(transport=DirectTransport(oss_agent))
-
-
-@pytest.fixture(scope="module")
-def kora_agent(consumer_agent):
-    """Kora agent wired so it can reach consumer-team (which in turn reaches oss-kafka)."""
-    class DirectTransport:
-        def __init__(self, consumer):
-            self._consumer = consumer
-
-        def consult(self, peer_id: str, request: ImpactRequest) -> ImpactResponse:
-            if peer_id == "consumer-team":
-                return self._consumer.consult_about(request, depth=request.consultation_depth)
-            # For oss-kafka direct consultation from kora
-            oss = OssKafkaAgent()
-            return oss.consult_about(request, depth=request.consultation_depth)
-
-    return KoraGlobalAgent(transport=DirectTransport(consumer_agent))
+def network():
+    oss = OssKafkaAgent()
+    consumer = ConsumerTeamAgent(transport=DirectTransport({"oss-kafka": oss}))
+    kora_transport = DirectTransport({"consumer-team": consumer, "oss-kafka": oss})
+    kora = KoraGlobalAgent(transport=kora_transport)
+    return {
+        "kora": kora,
+        "consumer": consumer,
+        "oss": oss,
+        "kora_transport": kora_transport,
+    }
 
 
 @pytest.fixture(scope="module")
@@ -101,89 +64,287 @@ def ticket():
 
 
 @pytest.fixture(scope="module")
-def finding(kora_agent, ticket):
-    """The actual Finding produced by kora-global running OwnTicket() for real."""
-    return kora_agent.own_ticket(ticket)
+def finding(network, ticket):
+    """The real Finding produced by kora-global driving its own ticket."""
+    return network["kora"].own_ticket(ticket)
+
+
+@pytest.fixture(scope="module")
+def doc(finding):
+    return render_one_pager(finding)
 
 
 # ---------------------------------------------------------------------------
-# The tests
+# Ownership of the ticket
 # ---------------------------------------------------------------------------
 
-class TestPartVWalkthroughE2E:
-    def test_finding_belongs_to_kora_global(self, finding):
+class TestTicketOwnership:
+    def test_kora_global_owns_the_finding(self, finding):
         assert finding.owning_agent == "kora-global"
 
     def test_ticket_id_is_preserved(self, finding, ticket):
         assert finding.ticket_id == ticket.ticket_id
 
-    def test_kora_global_consulted_consumer_team(self, finding):
-        """Step 2: kora-global must have sent an ImpactRequest to consumer-team."""
-        consulted = [c["from_agent"] for c in finding.consultations]
-        assert "consumer-team" in consulted, (
-            f"consumer-team not in consultations. Got: {consulted}"
-        )
-
-    def test_kora_global_consulted_oss_kafka(self, finding):
-        """Step 3: kora-global must have consulted oss-kafka."""
-        consulted = [c["from_agent"] for c in finding.consultations]
-        assert "oss-kafka" in consulted, (
-            f"oss-kafka not in consultations. Got: {consulted}"
-        )
-
-    def test_consumer_team_appears_before_oss_kafka_in_consultation_order(self, finding):
-        """consumer-team must come first (kora consults it directly; it then consults oss-kafka)."""
-        agents_in_order = [c["from_agent"] for c in finding.consultations]
-        assert agents_in_order.index("consumer-team") < agents_in_order.index("oss-kafka"), (
-            f"Expected consumer-team before oss-kafka. Got order: {agents_in_order}"
-        )
-
-    def test_finding_has_five_execution_order_steps(self, finding):
-        """§11 specifies exactly 5 steps in the execution plan."""
-        assert len(finding.execution_order) == 5, (
-            f"Expected 5 execution steps, got {len(finding.execution_order)}: "
-            f"{finding.execution_order}"
-        )
-
-    def test_finding_approvals_needed_includes_consumer_team(self, finding):
-        approvals_str = " ".join(finding.approvals_needed).lower()
-        assert "consumer-team" in approvals_str, (
-            f"consumer-team not in approvals_needed: {finding.approvals_needed}"
-        )
-
-    def test_finding_approvals_needed_includes_oss_kafka(self, finding):
-        approvals_str = " ".join(finding.approvals_needed).lower()
-        assert "oss-kafka" in approvals_str, (
-            f"oss-kafka not in approvals_needed: {finding.approvals_needed}"
-        )
-
-    def test_finding_requires_human_is_true(self, finding):
-        assert finding.requires_human is True
-
-    def test_finding_confidence_is_high(self, finding):
-        assert finding.confidence >= 0.9, (
-            f"Expected confidence >= 0.9, got {finding.confidence}"
-        )
-
-    def test_kora_global_cited_codepaths_all_pass_ownership_validation(self, finding):
-        """§25 step 6: every codepath kora-global cites must pass its own OWNS check."""
-        results = validate_citations(finding.cited_codepaths, KoraGlobalAgent.OWNS)
-        unowned = [r for r in results if not r.owned]
-        assert len(unowned) == 0, (
-            f"kora-global cited paths it doesn't own: "
-            f"{[r.codepath for r in unowned]}"
-        )
-
-    def test_root_cause_mentions_listgroups(self, finding):
-        assert (
-            "listgroups" in finding.root_cause.lower()
-            or "listGroups" in finding.root_cause
-            or "scan" in finding.root_cause.lower()
-        )
-
-    def test_router_would_route_this_ticket_to_kora(self, ticket):
-        """Simulate the router step: team='kora-global' → routes to kora-global."""
+    def test_router_would_send_this_to_kora_and_nowhere_else(self, ticket):
         from router.main import get_agent_address
         addr = get_agent_address(ticket.team)
         assert addr is not None
         assert "kora" in addr or "8001" in addr
+
+
+# ---------------------------------------------------------------------------
+# Design alternatives
+# ---------------------------------------------------------------------------
+
+class TestThreeAlternatives:
+    def test_exactly_three_alternatives(self, finding):
+        assert len(finding.design_alternatives) == 3
+
+    def test_alternatives_are_genuinely_distinct(self, finding):
+        names = [a.name for a in finding.design_alternatives]
+        assert len(set(names)) == 3
+
+    def test_every_alternative_is_argued_in_depth(self, finding):
+        for alt in finding.design_alternatives:
+            assert len(alt.approach) > 200, f"{alt.name}: approach too shallow"
+            assert len(alt.pros) >= 3, f"{alt.name}: needs real pros"
+            assert len(alt.cons) >= 3, f"{alt.name}: needs real cons"
+            assert alt.blast_radius, f"{alt.name}: must declare blast radius"
+
+    def test_exactly_one_is_recommended(self, finding):
+        recommended = [a for a in finding.design_alternatives if a.recommended]
+        assert len(recommended) == 1
+
+    def test_the_other_two_are_ruled_out_with_stated_reasons(self, finding):
+        ruled_out = [a for a in finding.design_alternatives if a.is_ruled_out]
+        assert len(ruled_out) == 2
+        for alt in ruled_out:
+            assert len(alt.rejected_reason) > 20
+
+    def test_recommended_option_is_the_broker_side_index(self, finding):
+        rec = finding.recommended_alternative
+        assert rec is not None
+        assert "index" in rec.name.lower()
+
+    def test_all_alternatives_were_peer_reviewed(self, finding):
+        for alt in finding.design_alternatives:
+            assert alt.reviewed_by, f"{alt.name} was never reviewed by a peer"
+
+
+# ---------------------------------------------------------------------------
+# Multi-round deliberation
+# ---------------------------------------------------------------------------
+
+class TestDeliberation:
+    def test_took_more_than_one_round(self, finding):
+        assert finding.rounds_used >= 2, (
+            "consumer-team raises real concerns in round 1, so convergence in "
+            "round 1 would mean nobody actually pushed back"
+        )
+
+    def test_stayed_within_the_round_cap(self, finding):
+        assert finding.rounds_used <= KoraGlobalAgent.MAX_DELIBERATION_ROUNDS
+
+    def test_converged(self, finding):
+        assert finding.converged is True
+
+    def test_both_peers_were_consulted(self, finding):
+        consulted = {r.to_agent for r in finding.deliberation}
+        assert "consumer-team" in consulted
+        assert "oss-kafka" in consulted
+
+    def test_consumer_team_consulted_before_oss_kafka(self, finding):
+        order = [r.to_agent for r in finding.deliberation]
+        assert order.index("consumer-team") < order.index("oss-kafka")
+
+    def test_consumer_team_consulted_oss_kafka_on_its_own_initiative(self, network, ticket):
+        """kora-global never told consumer-team to ask oss-kafka."""
+        consumer = network["consumer"]
+        from proto.sme_agents import ImpactRequest
+        req = ImpactRequest.new(
+            from_agent="kora-global", to_agent="consumer-team",
+            ticket_id=ticket.ticket_id, request_type="design_review",
+            question="Is the index implementable?",  # says nothing about oss-kafka
+            round_number=1,
+        )
+        resp = consumer.consult_about(req, depth=0)
+        assert "oss-kafka" in resp.follow_up_consultations
+
+    def test_new_concerns_were_raised_during_deliberation(self, finding):
+        assert any(r.new_concerns_raised for r in finding.deliberation), (
+            "no agent raised a single concern — they rubber-stamped it"
+        )
+
+    def test_concerns_stop_being_raised_by_the_final_round(self, finding):
+        final_round = max(r.round_number for r in finding.deliberation)
+        final = [r for r in finding.deliberation if r.round_number == final_round]
+        assert all(not r.new_concerns_raised for r in final)
+
+    def test_deliberation_questions_are_specific_not_generic(self, finding):
+        for record in finding.deliberation:
+            assert len(record.question) > 80, (
+                f"round {record.round_number} question to {record.to_agent} is too vague"
+            )
+
+
+# ---------------------------------------------------------------------------
+# Substantive pushback — the principal-engineer test
+# ---------------------------------------------------------------------------
+
+class TestSubstantivePushback:
+    def test_consumer_team_corrected_kora_on_a_correctness_point(self, network, ticket):
+        """consumer-team must catch that commits != live subscriptions."""
+        from proto.sme_agents import ImpactRequest
+        req = ImpactRequest.new(
+            from_agent="kora-global", to_agent="consumer-team",
+            ticket_id=ticket.ticket_id, request_type="design_review",
+            question="review my alternatives", round_number=1,
+        )
+        resp = network["consumer"].consult_about(req, depth=0)
+        joined = " ".join(resp.new_concerns).lower()
+        assert "__consumer_offsets" in joined
+        assert "subscription" in joined
+
+    def test_every_agent_produced_a_principal_review(self, network, ticket):
+        from proto.sme_agents import ImpactRequest
+        for agent_key, agent_name in (("consumer", "consumer-team"), ("oss", "oss-kafka")):
+            req = ImpactRequest.new(
+                from_agent="kora-global", to_agent=agent_name,
+                ticket_id=ticket.ticket_id, request_type="design_review",
+                question="deep review please", round_number=1,
+            )
+            resp = network[agent_key].consult_about(req, depth=1)
+            assert len(resp.principal_review) > 400, (
+                f"{agent_name} gave a shallow review"
+            )
+
+
+# ---------------------------------------------------------------------------
+# requires_human — end only, and only for the real gate
+# ---------------------------------------------------------------------------
+
+class TestHumanEscalationIsEndOnlyAndMinimal:
+    def test_requires_human_is_true(self, finding):
+        assert finding.requires_human is True
+
+    def test_exactly_one_human_decision_point(self, finding):
+        assert len(finding.human_decision_points) == 1, (
+            f"expected exactly one escalation, got: {finding.human_decision_points}"
+        )
+
+    def test_the_escalation_is_the_apache_pmc_vote(self, finding):
+        point = finding.human_decision_points[0].lower()
+        assert "pmc" in point or "vote" in point
+        assert "oss-kafka" in point
+
+    def test_escalation_is_not_caused_by_non_convergence(self, finding):
+        assert not any("did not converge" in p for p in finding.human_decision_points)
+
+    def test_escalation_is_not_caused_by_unreachable_peers(self, finding):
+        assert not any("Could not reach" in p for p in finding.human_decision_points)
+
+    def test_ordinary_technical_uncertainty_did_not_escalate(self, finding):
+        """Memory cost, rebuild time, flag scope were all settled agent-to-agent."""
+        joined = " ".join(finding.human_decision_points).lower()
+        for resolved_topic in ("memory", "heap", "rebuild", "feature flag"):
+            assert resolved_topic not in joined, (
+                f"'{resolved_topic}' should have been settled by the agents"
+            )
+
+    def test_confidence_is_high_because_they_converged(self, finding):
+        assert finding.confidence >= 0.9
+
+
+# ---------------------------------------------------------------------------
+# 1-pager content
+# ---------------------------------------------------------------------------
+
+class TestOnePagerContent:
+    def test_has_a_tldr_with_the_recommendation(self, finding):
+        assert finding.tldr
+        rec = finding.recommended_alternative
+        assert rec is not None
+        assert rec.name in finding.tldr
+
+    def test_background_explains_what_cluster_linking_is(self, finding):
+        assert "cluster linking" in finding.background.lower()
+        assert len(finding.background) > 500
+
+    def test_has_goals_and_non_goals(self, finding):
+        assert len(finding.goals) >= 3
+        assert len(finding.non_goals) >= 3
+
+    def test_non_goals_explicitly_exclude_offset_translation(self, finding):
+        joined = " ".join(finding.non_goals).lower()
+        assert "translation" in joined
+
+    def test_has_five_execution_steps(self, finding):
+        assert len(finding.execution_order) == 5
+
+    def test_testing_strategy_aggregates_all_three_teams(self, finding):
+        joined = " ".join(finding.testing_strategy)
+        for team in ("kora-global", "consumer-team", "oss-kafka"):
+            assert team in joined
+
+    def test_has_risks_rollout_and_success_metrics(self, finding):
+        assert len(finding.risks_and_mitigations) >= 3
+        assert len(finding.rollout_and_rollback) >= 3
+        assert len(finding.success_metrics) >= 3
+
+    def test_teams_involved_covers_four_teams_with_roles(self, finding):
+        teams = {t.team: t for t in finding.teams_involved}
+        assert {"kora-global", "consumer-team", "oss-kafka", "broker-team"} <= set(teams)
+        assert teams["kora-global"].role == "owner"
+        assert teams["oss-kafka"].sign_off_required is True
+
+
+# ---------------------------------------------------------------------------
+# Ownership discipline across the whole run
+# ---------------------------------------------------------------------------
+
+class TestOwnershipDiscipline:
+    def test_kora_cited_only_what_it_owns(self, finding):
+        results = validate_citations(finding.cited_codepaths, KoraGlobalAgent.OWNS)
+        assert [r.codepath for r in results if not r.owned] == []
+
+    def test_each_agents_alternatives_are_attributed_correctly(self, finding):
+        for alt in finding.design_alternatives:
+            assert alt.proposed_by == "kora-global"
+
+    def test_no_unflagged_out_of_bounds_citations_anywhere(self, finding):
+        """§25 step 6 — zero unflagged ownership violations in the whole run."""
+        unflagged = [
+            q for q in finding.open_questions
+            if q.startswith("needs_verification:")
+        ]
+        assert unflagged == [], f"unflagged ownership violations: {unflagged}"
+
+
+# ---------------------------------------------------------------------------
+# Rendered document
+# ---------------------------------------------------------------------------
+
+class TestRenderedDocument:
+    def test_renders_without_error(self, doc):
+        assert doc
+        assert doc.startswith("# ")
+
+    def test_contains_every_required_section(self, doc):
+        for section in (
+            "## TL;DR", "## Background", "## Goals", "## Design Alternatives",
+            "## Recommendation", "## Testing Strategy", "## Teams Involved",
+            "## Execution Plan", "## Risks & Mitigations", "## Rollout & Rollback",
+            "## Success Metrics", "## Decisions Requiring a Human",
+            "## Appendix: Deliberation Record",
+        ):
+            assert section in doc, f"missing: {section}"
+
+    def test_shows_all_three_alternatives_with_one_recommended(self, doc):
+        assert "### Alternative A:" in doc
+        assert "### Alternative B:" in doc
+        assert "### Alternative C:" in doc
+        assert doc.count("**RECOMMENDED**") == 1
+
+    def test_deliberation_record_shows_the_rounds(self, doc):
+        assert "| Round | From | To | Verdict |" in doc
+        assert "Round 1, `kora-global` → `consumer-team`" in doc

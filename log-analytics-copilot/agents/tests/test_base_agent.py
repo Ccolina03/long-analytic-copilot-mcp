@@ -1,31 +1,30 @@
 """
-Phase 3 — Base Agent Framework tests.
+Phase 3 — Base Agent Framework tests (Principal Engineer behaviour model).
 
-Tests
------
-  test_tool_decorator_registers_method_under_given_name
-  test_get_tools_returns_all_registered_tools
-  test_own_ticket_calls_investigate_before_deciding_who_to_consult
-  test_own_ticket_only_consults_agents_returned_by_select_peers
-  test_consult_about_can_itself_trigger_a_further_consult_about_call
-  test_consultation_depth_is_bounded_to_avoid_infinite_chains
-  test_consult_about_flags_unowned_citations
-  test_null_transport_returns_timed_out_response
-  test_mock_transport_returns_canned_response
+Focus areas
+-----------
+  - @tool registration
+  - the 3-alternatives requirement is enforced
+  - multi-round deliberation loop: rounds, convergence, round cap
+  - requires_human is decided ONLY at the end, and only for real org gates
+  - consultation depth bounding
+  - ownership self-validation on outbound responses
 """
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import pytest
 
 from agents.base_agent import (
+    DirectTransport,
     MockTransport,
     NullTransport,
-    SMEAgentBase,
     PeerTransport,
+    SMEAgentBase,
     tool,
 )
 from proto.sme_agents import (
+    DesignAlternative,
     Finding,
     ImpactRequest,
     ImpactResponse,
@@ -34,8 +33,20 @@ from proto.sme_agents import (
 
 
 # ---------------------------------------------------------------------------
-# Minimal concrete agent for testing (not one of the real agents)
+# Test fixtures / helper agents
 # ---------------------------------------------------------------------------
+
+def _alts(proposer: str, n: int = 3) -> list[DesignAlternative]:
+    return [
+        DesignAlternative(
+            label=chr(ord("A") + i),
+            name=f"{proposer} option {chr(ord('A') + i)}",
+            proposed_by=proposer,
+            approach=f"approach {i}",
+        )
+        for i in range(n)
+    ]
+
 
 class SimpleTestAgent(SMEAgentBase):
     AGENT_NAME = "test-agent"
@@ -50,187 +61,348 @@ class SimpleTestAgent(SMEAgentBase):
     def do_something_else(self) -> dict:
         return {"result": "else"}
 
+    def _propose_alternatives(self, ticket, investigation):
+        return _alts(self.AGENT_NAME)
 
-class RecordingAgent(SMEAgentBase):
-    """Agent that records which lifecycle hooks were called."""
-    AGENT_NAME = "recording-agent"
-    DOMAIN = "Recording"
-    OWNS = ["Recording.java"]
 
-    def __init__(self, **kwargs):
-        super().__init__(**kwargs)
-        self.investigate_called = False
-        self.select_peers_called = False
+class SoloAgent(SMEAgentBase):
+    """Owns a ticket with no peers to consult — settles it alone."""
+    AGENT_NAME = "solo-agent"
+    DOMAIN = "Solo work"
+    OWNS = ["Solo.java"]
 
     def _investigate(self, ticket):
-        self.investigate_called = True
-        return {"root_cause": "recorded", "cited_codepaths": ["Recording.java"]}
+        return {"root_cause": "self-contained", "cited_codepaths": ["Solo.java"]}
+
+    def _propose_alternatives(self, ticket, investigation):
+        alts = _alts(self.AGENT_NAME)
+        alts[0].recommended = True
+        return alts
 
     def _select_peers(self, ticket, investigation):
-        self.select_peers_called = True
-        return []  # no consultations
+        return []
 
 
-class PeerConsultingAgent(SMEAgentBase):
-    """Agent that always consults one peer."""
-    AGENT_NAME = "consulting-agent"
-    DOMAIN = "Consulting"
-    OWNS = ["Consulting.java"]
+class TwoAlternativeAgent(SMEAgentBase):
+    """Violates the principal-engineer contract by proposing only 2 options."""
+    AGENT_NAME = "lazy-agent"
+    OWNS = []
+
+    def _propose_alternatives(self, ticket, investigation):
+        return _alts(self.AGENT_NAME, n=2)
+
+
+class DeliberatingAgent(SMEAgentBase):
+    """Owns a ticket and consults exactly one peer."""
+    AGENT_NAME = "driver-agent"
+    DOMAIN = "Driving"
+    OWNS = ["Driver.java"]
 
     def _investigate(self, ticket):
-        return {"root_cause": "requires peer input", "cited_codepaths": []}
+        return {"root_cause": "needs peer input", "cited_codepaths": ["Driver.java"]}
+
+    def _propose_alternatives(self, ticket, investigation):
+        return _alts(self.AGENT_NAME)
 
     def _select_peers(self, ticket, investigation):
         return [("peer-agent", "PeerFile.java")]
 
 
-class CyclicAgent(SMEAgentBase):
-    """Agent that would cause an infinite consultation loop if not bounded."""
-    AGENT_NAME = "cyclic-agent"
-    DOMAIN = "Cyclic"
-    OWNS = []
+class StubbornPeer(SMEAgentBase):
+    """Never agrees — always raises a new concern. Forces the round cap."""
+    AGENT_NAME = "peer-agent"
+    OWNS = ["PeerFile.java"]
 
     def _handle_consultation(self, request, depth):
-        # Tries to consult itself — should be stopped by depth limit
-        sub_request = ImpactRequest.new(
+        return ImpactResponse(
+            request_id=request.request_id,
             from_agent=self.AGENT_NAME,
-            to_agent=self.AGENT_NAME,
-            ticket_id=request.ticket_id,
-            request_type="impact_analysis",
-            consultation_depth=depth + 1,
+            to_agent=request.from_agent,
+            verdict="needs_changes",
+            summary=f"still unhappy at round {request.round_number}",
+            new_concerns=[f"fresh concern raised in round {request.round_number}"],
         )
-        return self._transport.consult(self.AGENT_NAME, sub_request)
+
+
+class AgreeableePeer(SMEAgentBase):
+    """Agrees immediately with no new concerns — converges in round 1."""
+    AGENT_NAME = "peer-agent"
+    OWNS = ["PeerFile.java"]
+
+    def _handle_consultation(self, request, depth):
+        return ImpactResponse(
+            request_id=request.request_id,
+            from_agent=self.AGENT_NAME,
+            to_agent=request.from_agent,
+            verdict="agreed",
+            summary="looks right to me",
+            recommendation="driver-agent option A",
+            new_concerns=[],
+        )
+
+
+class OrgGatePeer(SMEAgentBase):
+    """Agrees technically but flags a genuine organizational gate."""
+    AGENT_NAME = "peer-agent"
+    OWNS = ["PeerFile.java"]
+
+    def _handle_consultation(self, request, depth):
+        return ImpactResponse(
+            request_id=request.request_id,
+            from_agent=self.AGENT_NAME,
+            to_agent=request.from_agent,
+            verdict="agreed",
+            summary="design is fine",
+            recommendation="driver-agent option A",
+            new_concerns=[],
+            needs_org_authority=True,
+            org_authority_reason="external standards-body vote required",
+        )
+
+
+@pytest.fixture
+def ticket():
+    return Ticket.new(team="driver-agent", title="t", description="d")
 
 
 # ---------------------------------------------------------------------------
-# Tests
+# Tool registry
 # ---------------------------------------------------------------------------
 
 class TestToolDecorator:
-    def test_decorator_registers_method_under_given_name(self):
-        agent = SimpleTestAgent()
-        tools = agent.get_tools()
+    def test_registers_method_under_given_name(self):
+        tools = SimpleTestAgent().get_tools()
         assert "do_something" in tools
         assert "do_something_else" in tools
 
     def test_registered_tool_is_callable(self):
-        agent = SimpleTestAgent()
-        tools = agent.get_tools()
-        result = tools["do_something"]("hello")
-        assert result == {"x": "hello", "done": True}
+        tools = SimpleTestAgent().get_tools()
+        assert tools["do_something"]("hello") == {"x": "hello", "done": True}
 
-    def test_get_tools_does_not_include_non_tool_methods(self):
-        agent = SimpleTestAgent()
-        tools = agent.get_tools()
+    def test_does_not_include_non_tool_methods(self):
+        tools = SimpleTestAgent().get_tools()
         assert "get_tools" not in tools
         assert "own_ticket" not in tools
 
 
-class TestOwnTicketWorkflow:
-    def test_calls_investigate_before_deciding_who_to_consult(self):
-        agent = RecordingAgent()
-        ticket = Ticket.new(team="recording-agent", title="test", description="desc")
-        agent.own_ticket(ticket)
-        assert agent.investigate_called
-        assert agent.select_peers_called
+# ---------------------------------------------------------------------------
+# Principal-engineer contract: always 3 alternatives
+# ---------------------------------------------------------------------------
 
-    def test_only_consults_agents_returned_by_select_peers(self):
-        """If _select_peers returns [], transport.consult() is never called."""
-        transport = MagicMock(spec=PeerTransport)
-        agent = RecordingAgent(transport=transport)
-        ticket = Ticket.new(team="recording-agent", title="t", description="d")
-        agent.own_ticket(ticket)
-        transport.consult.assert_not_called()
+class TestAlternativesContract:
+    def test_three_alternatives_is_the_required_count(self):
+        assert SMEAgentBase.ALTERNATIVES_REQUIRED == 3
 
-    def test_returns_finding_with_correct_ticket_id(self):
-        agent = RecordingAgent()
-        ticket = Ticket.new(team="recording-agent", title="t", description="d")
+    def test_agent_proposing_only_two_alternatives_raises(self, ticket):
+        agent = TwoAlternativeAgent()
+        with pytest.raises(ValueError, match="must return exactly 3 design alternatives"):
+            agent.own_ticket(ticket)
+
+    def test_finding_carries_all_three_alternatives(self, ticket):
+        agent = DeliberatingAgent(
+            transport=DirectTransport({"peer-agent": AgreeableePeer()})
+        )
         finding = agent.own_ticket(ticket)
-        assert isinstance(finding, Finding)
-        assert finding.ticket_id == ticket.ticket_id
-        assert finding.owning_agent == "recording-agent"
+        assert len(finding.design_alternatives) == 3
 
-    def test_consults_peer_once_per_select_peers_entry(self):
-        canned = ImpactResponse(
-            request_id="r1",
-            from_agent="peer-agent",
-            to_agent="consulting-agent",
-            verdict="approved",
+    def test_ruled_out_alternatives_are_kept_not_deleted(self, ticket):
+        """The doc must show the full solution space that was considered."""
+        agent = DeliberatingAgent(
+            transport=DirectTransport({"peer-agent": AgreeableePeer()})
         )
-        transport = MockTransport({"peer-agent": canned})
-        agent = PeerConsultingAgent(transport=transport)
-        ticket = Ticket.new(team="consulting-agent", title="t", description="d")
         finding = agent.own_ticket(ticket)
-        assert len(finding.consultations) == 1
-        assert finding.consultations[0]["from_agent"] == "peer-agent"
+        # Peer endorsed option A, so B and C should be ruled out but still present
+        assert len(finding.design_alternatives) == 3
+        ruled_out = [a for a in finding.design_alternatives if a.is_ruled_out]
+        assert len(ruled_out) == 2
+        for alt in ruled_out:
+            assert alt.rejected_reason, "ruled-out alternative must explain why"
 
 
-class TestConsultAboutWorkflow:
-    def test_consult_about_can_trigger_further_consult(self):
-        """An agent receiving a ConsultAbout CAN consult a third agent unprompted."""
-        # oss_kafka returns a canned response when called
-        oss_response = ImpactResponse(
-            request_id="r2",
-            from_agent="oss-kafka",
-            to_agent="consumer-team",
-            verdict="needs_changes",
-            summary="New KIP required",
+# ---------------------------------------------------------------------------
+# Multi-round deliberation
+# ---------------------------------------------------------------------------
+
+class TestDeliberation:
+    def test_default_round_cap_is_three(self):
+        assert SMEAgentBase.MAX_DELIBERATION_ROUNDS == 3
+
+    def test_converges_in_round_one_when_peer_agrees_immediately(self, ticket):
+        agent = DeliberatingAgent(
+            transport=DirectTransport({"peer-agent": AgreeableePeer()})
         )
-        transport = MockTransport({"oss-kafka": oss_response})
+        finding = agent.own_ticket(ticket)
+        assert finding.converged is True
+        assert finding.rounds_used == 1
 
-        from agents.consumer_team_agent import ConsumerTeamAgent
-        consumer = ConsumerTeamAgent(transport=transport)
-
-        request = ImpactRequest.new(
-            from_agent="kora-global",
-            to_agent="consumer-team",
-            ticket_id="t-1",
-            request_type="impact_analysis",
+    def test_stubborn_peer_forces_the_full_round_cap(self, ticket):
+        agent = DeliberatingAgent(
+            transport=DirectTransport({"peer-agent": StubbornPeer()})
         )
-        response = consumer.consult_about(request, depth=0)
-        assert response.from_agent == "consumer-team"
-        # Consumer team should have consulted oss-kafka and reported it
-        assert "oss-kafka" in response.follow_up_consultations or \
-               any("kip" in q.lower() or "oss-kafka" in q.lower()
-                   for q in response.open_questions) or \
-               "oss-kafka" in response.summary.lower()
+        finding = agent.own_ticket(ticket)
+        assert finding.converged is False
+        assert finding.rounds_used == 3
 
-    def test_consultation_depth_is_bounded_to_avoid_infinite_chains(self):
-        """A cyclic consultation chain must terminate at MAX_CONSULTATION_DEPTH."""
-        # CyclicAgent tries to consult itself endlessly
-        # We mock the transport to simulate this
+    def test_deliberation_record_has_one_entry_per_round_per_peer(self, ticket):
+        agent = DeliberatingAgent(
+            transport=DirectTransport({"peer-agent": StubbornPeer()})
+        )
+        finding = agent.own_ticket(ticket)
+        # 3 rounds x 1 peer
+        assert len(finding.deliberation) == 3
+        assert [r.round_number for r in finding.deliberation] == [1, 2, 3]
+
+    def test_round_number_is_propagated_into_the_request(self, ticket):
+        transport = DirectTransport({"peer-agent": StubbornPeer()})
+        agent = DeliberatingAgent(transport=transport)
+        agent.own_ticket(ticket)
+        assert [c.round_number for c in transport.calls] == [1, 2, 3]
+
+    def test_prior_concerns_accumulate_across_rounds(self, ticket):
+        transport = DirectTransport({"peer-agent": StubbornPeer()})
+        agent = DeliberatingAgent(transport=transport)
+        agent.own_ticket(ticket)
+        # Round 1 starts empty; later rounds carry forward what was raised
+        assert transport.calls[0].prior_concerns == []
+        assert len(transport.calls[1].prior_concerns) >= 1
+        assert len(transport.calls[2].prior_concerns) >= len(transport.calls[1].prior_concerns)
+
+    def test_new_concerns_are_recorded_in_the_deliberation_log(self, ticket):
+        agent = DeliberatingAgent(
+            transport=DirectTransport({"peer-agent": StubbornPeer()})
+        )
+        finding = agent.own_ticket(ticket)
+        assert any(r.new_concerns_raised for r in finding.deliberation)
+
+    def test_no_peers_means_immediate_convergence(self, ticket):
+        agent = SoloAgent()
+        finding = agent.own_ticket(Ticket.new(team="solo-agent", title="t", description="d"))
+        assert finding.converged is True
+        assert finding.rounds_used == 1
+
+    def test_alternatives_record_who_reviewed_them(self, ticket):
+        agent = DeliberatingAgent(
+            transport=DirectTransport({"peer-agent": AgreeableePeer()})
+        )
+        finding = agent.own_ticket(ticket)
+        for alt in finding.design_alternatives:
+            assert "peer-agent" in alt.reviewed_by
+
+
+# ---------------------------------------------------------------------------
+# requires_human — decided once, at the end, only for real org gates
+# ---------------------------------------------------------------------------
+
+class TestRequiresHumanIsEndOnly:
+    def test_false_when_agents_converge_with_no_org_gate(self, ticket):
+        agent = DeliberatingAgent(
+            transport=DirectTransport({"peer-agent": AgreeableePeer()})
+        )
+        finding = agent.own_ticket(ticket)
+        assert finding.converged is True
+        assert finding.requires_human is False
+        assert finding.human_decision_points == []
+
+    def test_true_when_a_peer_flags_genuine_org_authority(self, ticket):
+        agent = DeliberatingAgent(
+            transport=DirectTransport({"peer-agent": OrgGatePeer()})
+        )
+        finding = agent.own_ticket(ticket)
+        assert finding.requires_human is True
+        assert any("standards-body" in p for p in finding.human_decision_points)
+
+    def test_true_when_deliberation_fails_to_converge(self, ticket):
+        agent = DeliberatingAgent(
+            transport=DirectTransport({"peer-agent": StubbornPeer()})
+        )
+        finding = agent.own_ticket(ticket)
+        assert finding.requires_human is True
+        assert any("did not converge" in p for p in finding.human_decision_points)
+
+    def test_true_when_a_peer_is_unreachable(self, ticket):
+        agent = DeliberatingAgent(transport=NullTransport())
+        finding = agent.own_ticket(ticket)
+        assert finding.requires_human is True
+        assert any("Could not reach" in p for p in finding.human_decision_points)
+
+    def test_mid_deliberation_concerns_alone_do_not_escalate(self, ticket):
+        """A peer raising concerns then agreeing must NOT trigger escalation."""
+        class ConcernThenAgreePeer(SMEAgentBase):
+            AGENT_NAME = "peer-agent"
+            OWNS = ["PeerFile.java"]
+
+            def _handle_consultation(self, request, depth):
+                if request.round_number == 1:
+                    return ImpactResponse(
+                        request_id=request.request_id,
+                        from_agent=self.AGENT_NAME, to_agent=request.from_agent,
+                        verdict="needs_changes",
+                        summary="concerns in round 1",
+                        new_concerns=["memory cost needs checking"],
+                    )
+                return ImpactResponse(
+                    request_id=request.request_id,
+                    from_agent=self.AGENT_NAME, to_agent=request.from_agent,
+                    verdict="agreed",
+                    summary="satisfied now",
+                    recommendation="driver-agent option A",
+                    new_concerns=[],
+                )
+
+        agent = DeliberatingAgent(
+            transport=DirectTransport({"peer-agent": ConcernThenAgreePeer()})
+        )
+        finding = agent.own_ticket(ticket)
+        assert finding.rounds_used == 2
+        assert finding.converged is True
+        assert finding.requires_human is False
+
+    def test_solo_agent_with_recommendation_does_not_escalate(self):
+        agent = SoloAgent()
+        finding = agent.own_ticket(
+            Ticket.new(team="solo-agent", title="t", description="d")
+        )
+        assert finding.requires_human is False
+
+
+# ---------------------------------------------------------------------------
+# ConsultAbout
+# ---------------------------------------------------------------------------
+
+class TestConsultAbout:
+    def test_consultation_depth_is_bounded(self):
         depth_calls = []
 
         class CountingCyclicAgent(SMEAgentBase):
             AGENT_NAME = "cyclic"
             OWNS = []
 
-            def _handle_consultation(self_inner, request, depth):
+            def _handle_consultation(inner, request, depth):
                 depth_calls.append(depth)
-                if depth < self_inner.MAX_CONSULTATION_DEPTH:
-                    # simulate deeper call
-                    sub = ImpactRequest.new("cyclic", "cyclic", "t", "r",
-                                           consultation_depth=depth + 1)
-                    return self_inner.consult_about(sub, depth=depth + 1)
+                if depth < inner.MAX_CONSULTATION_DEPTH:
+                    sub = ImpactRequest.new(
+                        "cyclic", "cyclic", "t", "design_review",
+                        consultation_depth=depth + 1,
+                    )
+                    return inner.consult_about(sub, depth=depth + 1)
                 return ImpactResponse(
                     request_id=request.request_id,
-                    from_agent="cyclic",
-                    to_agent="cyclic",
-                    verdict="unknown",
+                    from_agent="cyclic", to_agent="cyclic", verdict="unknown",
                 )
 
         agent = CountingCyclicAgent()
-        req = ImpactRequest.new("a", "cyclic", "t", "r")
-        response = agent.consult_about(req, depth=0)
-
-        # Must not recurse beyond MAX_CONSULTATION_DEPTH
+        agent.consult_about(ImpactRequest.new("a", "cyclic", "t", "design_review"), depth=0)
         assert max(depth_calls) <= CountingCyclicAgent.MAX_CONSULTATION_DEPTH
-        # The final response when depth limit is reached must have timed_out=True
-        # (the base class sets it when depth >= limit)
-        assert response is not None
 
-    def test_consult_about_flags_unowned_citations_as_open_questions(self):
-        """Citations outside OWNS must appear in open_questions after self-validation."""
+    def test_depth_limit_returns_timed_out_response(self):
+        agent = SimpleTestAgent()
+        resp = agent.consult_about(
+            ImpactRequest.new("a", "test-agent", "t", "design_review"),
+            depth=SimpleTestAgent.MAX_CONSULTATION_DEPTH,
+        )
+        assert resp.timed_out is True
+
+    def test_flags_unowned_citations_as_open_questions(self):
         class CitingAgent(SMEAgentBase):
             AGENT_NAME = "citing-agent"
             OWNS = ["OwnedFile.java"]
@@ -238,37 +410,56 @@ class TestConsultAboutWorkflow:
             def _handle_consultation(self, request, depth):
                 return ImpactResponse(
                     request_id=request.request_id,
-                    from_agent=self.AGENT_NAME,
-                    to_agent=request.from_agent,
-                    verdict="approved",
+                    from_agent=self.AGENT_NAME, to_agent=request.from_agent,
+                    verdict="agreed",
                     cited_codepaths=["OwnedFile.java", "UnownedFile.java"],
                 )
 
-        agent = CitingAgent()
-        req = ImpactRequest.new("peer", "citing-agent", "t", "r")
-        response = agent.consult_about(req)
-        # UnownedFile.java should be flagged
-        assert any("UnownedFile.java" in q for q in response.open_questions)
+        resp = CitingAgent().consult_about(
+            ImpactRequest.new("peer", "citing-agent", "t", "design_review")
+        )
+        assert any("UnownedFile.java" in q for q in resp.open_questions)
 
+
+# ---------------------------------------------------------------------------
+# Transports
+# ---------------------------------------------------------------------------
 
 class TestTransports:
-    def test_null_transport_returns_timed_out_response(self):
-        transport = NullTransport()
-        req = ImpactRequest.new("a", "b", "t", "r")
-        resp = transport.consult("b", req)
+    def test_null_transport_returns_timed_out(self):
+        resp = NullTransport().consult("b", ImpactRequest.new("a", "b", "t", "r"))
         assert resp.timed_out is True
 
     def test_mock_transport_returns_canned_response(self):
         canned = ImpactResponse(
-            request_id="x", from_agent="b", to_agent="a", verdict="approved"
+            request_id="x", from_agent="b", to_agent="a", verdict="agreed"
         )
-        transport = MockTransport({"b": canned})
-        req = ImpactRequest.new("a", "b", "t", "r")
-        resp = transport.consult("b", req)
-        assert resp.verdict == "approved"
+        resp = MockTransport({"b": canned}).consult(
+            "b", ImpactRequest.new("a", "b", "t", "r")
+        )
+        assert resp.verdict == "agreed"
 
-    def test_mock_transport_returns_timed_out_for_unknown_peer(self):
+    def test_mock_transport_records_calls(self):
         transport = MockTransport({})
-        req = ImpactRequest.new("a", "unknown", "t", "r")
-        resp = transport.consult("unknown", req)
+        transport.consult("b", ImpactRequest.new("a", "b", "t", "r"))
+        assert len(transport.calls) == 1
+
+    def test_mock_transport_times_out_for_unknown_peer(self):
+        resp = MockTransport({}).consult(
+            "unknown", ImpactRequest.new("a", "unknown", "t", "r")
+        )
+        assert resp.timed_out is True
+
+    def test_direct_transport_calls_real_peer_code(self):
+        transport = DirectTransport({"peer-agent": AgreeableePeer()})
+        resp = transport.consult(
+            "peer-agent", ImpactRequest.new("a", "peer-agent", "t", "design_review")
+        )
+        assert resp.from_agent == "peer-agent"
+        assert resp.verdict == "agreed"
+
+    def test_direct_transport_times_out_for_unregistered_peer(self):
+        resp = DirectTransport({}).consult(
+            "nobody", ImpactRequest.new("a", "nobody", "t", "r")
+        )
         assert resp.timed_out is True
