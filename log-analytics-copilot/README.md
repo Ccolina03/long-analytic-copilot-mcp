@@ -8,7 +8,7 @@ Specialized engineering agents that pick up a ticket, figure out which teams are
 
 ## Demo
 
-**[▶ Watch the demo (video)](https://github.com/Ccolina03/long-analytic-copilot-mcp/blob/main/log-analytics-copilot/demo/sme-network-demo.webm)**
+**[▶ Watch the demo (video)](https://github.com/Ccolina03/sme-agent-network/blob/main/log-analytics-copilot/demo/sme-network-demo.webm)**
 
 ```bash
 python -m pytest -q
