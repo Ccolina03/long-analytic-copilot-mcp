@@ -69,9 +69,9 @@ class TestParseCodeownersFile:
         entries = parse_codeowners_file(text)
         # Comments and blanks are stripped; we should have 5 real entries
         assert len(entries) >= 4
-        # The kora-global entry must be present
+        # The mirrormaker entry must be present
         patterns = [e[0] for e in entries]
-        assert "/confluent/kora-cluster-linking/" in patterns
+        assert "/connect/mirror/src/main/java/org/apache/kafka/connect/mirror/" in patterns
 
     def test_ignores_comment_lines_and_blank_lines(self):
         text = """
@@ -86,18 +86,18 @@ class TestParseCodeownersFile:
 
 
 class TestParseRunbookOwns:
-    _KORA_RUNBOOK = pathlib.Path(__file__).parent.parent.parent / "runbooks" / "kora-global-sme.md"
+    _MM_RUNBOOK = pathlib.Path(__file__).parent.parent.parent / "runbooks" / "mirrormaker-sme.md"
 
-    def test_extracts_owns_paths_from_kora_runbook(self):
-        if not self._KORA_RUNBOOK.exists():
-            pytest.skip("kora-global-sme.md not found")
-        text = self._KORA_RUNBOOK.read_text()
+    def test_extracts_owns_paths_from_mirrormaker_runbook(self):
+        if not self._MM_RUNBOOK.exists():
+            pytest.skip("mirrormaker-sme.md not found")
+        text = self._MM_RUNBOOK.read_text()
         # inject a synthetic OWNS block for testing (the real runbook uses prose)
-        synthetic = text + "\nOWNS = [\n    \"OffsetClampingService.java\",\n    \"FailoverCoordinator.java\",\n]\n"
-        entries = parse_runbook_owns(synthetic, "kora-global")
+        synthetic = text + "\nOWNS = [\n    \"MirrorCheckpointConnector.java\",\n    \"MirrorCheckpointTask.java\",\n]\n"
+        entries = parse_runbook_owns(synthetic, "mirrormaker")
         assert len(entries) == 2
-        assert ("OffsetClampingService.java", "kora-global") in entries
-        assert ("FailoverCoordinator.java", "kora-global") in entries
+        assert ("MirrorCheckpointConnector.java", "mirrormaker") in entries
+        assert ("MirrorCheckpointTask.java", "mirrormaker") in entries
 
     def test_returns_empty_list_when_no_owns_block(self):
         text = "# Just a runbook with no OWNS block"
@@ -154,12 +154,12 @@ class TestIngestCodeowners:
 class TestIngestRunbook:
     def test_runbook_ingest_produces_owns_edges_with_correct_team(self):
         conn = _fresh_db()
-        text = 'OWNS = [\n    "OffsetClampingService.java",\n    "FailoverCoordinator.java",\n]\n'
-        count = ingest_runbook(conn, text, agent_id="kora-global")
+        text = 'OWNS = [\n    "MirrorCheckpointConnector.java",\n    "MirrorCheckpointTask.java",\n]\n'
+        count = ingest_runbook(conn, text, agent_id="mirrormaker")
         assert count == 2
         # Verify the team entity was created
         team = conn.execute(
             "SELECT name FROM entities WHERE entity_type = 'team'"
         ).fetchone()
         assert team is not None
-        assert team[0] == "kora-global"
+        assert team[0] == "mirrormaker"

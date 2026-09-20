@@ -25,7 +25,7 @@ INTERNAL_BOOTSTRAP="${KAFKA_INTERNAL_BOOTSTRAP:-kafka:29092}"
 KAFKA_IMAGE="${KAFKA_IMAGE:-bitnamilegacy/kafka:3.7}"
 TEST_PAYLOAD="kafka-smoke-$(date +%s)-$$"
 
-KAFKA_BIN="/opt/bitnami/kafka/bin"
+KAFKA_BIN="/opt/kafka/bin"
 
 # ---------------------------------------------------------------------------
 # Pretty output
@@ -66,7 +66,7 @@ ok "container running${health:+ (}${health}${health:+)}"
 # 1. KRaft mode, no Zookeeper
 # ---------------------------------------------------------------------------
 step "1/5 KRaft mode is active and Zookeeper is absent"
-cfg="$(docker exec "$CONTAINER" bash -lc 'cat /opt/bitnami/kafka/config/server.properties')"
+cfg="$(docker exec "$CONTAINER" sh -c 'cat /opt/kafka/config/server.properties 2>/dev/null || true')"
 echo "$cfg" | grep -q '^process.roles=' \
   || fail "process.roles missing — broker is not in KRaft mode"
 roles="$(echo "$cfg" | awk -F= '/^process.roles=/{print $2}')"

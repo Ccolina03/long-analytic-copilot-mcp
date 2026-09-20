@@ -39,9 +39,9 @@ class TestTokenUsage:
 class TestRecording:
     def test_records_a_call(self):
         b = TicketBudget("T-1")
-        rec = b.record(agent_id="kora-global", tier="deep", response=resp(0.001))
+        rec = b.record(agent_id="mirrormaker", tier="deep", response=resp(0.001))
         assert b.call_count == 1
-        assert rec.agent_id == "kora-global"
+        assert rec.agent_id == "mirrormaker"
         assert rec.tier == "deep"
 
     def test_accumulates_cost(self):
@@ -67,12 +67,12 @@ class TestRecording:
 class TestAttribution:
     def test_cost_by_agent(self):
         b = TicketBudget("T-1")
-        b.record(agent_id="kora-global", tier="standard", response=resp(0.005))
-        b.record(agent_id="oss-kafka", tier="deep", response=resp(0.020))
-        b.record(agent_id="oss-kafka", tier="deep", response=resp(0.010))
+        b.record(agent_id="mirrormaker", tier="standard", response=resp(0.005))
+        b.record(agent_id="kafka-clients", tier="deep", response=resp(0.020))
+        b.record(agent_id="kafka-clients", tier="deep", response=resp(0.010))
         assert b.cost_by_agent() == {
-            "kora-global": pytest.approx(0.005),
-            "oss-kafka": pytest.approx(0.030),
+            "mirrormaker": pytest.approx(0.005),
+            "kafka-clients": pytest.approx(0.030),
         }
 
     def test_cost_by_tier_shows_where_money_goes(self):
@@ -176,12 +176,12 @@ class TestSummary:
 
     def test_summary_includes_cost_agents_and_tiers(self):
         b = TicketBudget("T-42", limit_usd=0.50)
-        b.record(agent_id="kora-global", tier="standard", response=resp(0.004))
-        b.record(agent_id="oss-kafka", tier="deep", response=resp(0.021))
+        b.record(agent_id="mirrormaker", tier="standard", response=resp(0.004))
+        b.record(agent_id="kafka-clients", tier="deep", response=resp(0.021))
         text = b.summary()
         assert "T-42" in text
-        assert "kora-global" in text
-        assert "oss-kafka" in text
+        assert "mirrormaker" in text
+        assert "kafka-clients" in text
         assert "deep" in text
         assert "0.0250" in text
 

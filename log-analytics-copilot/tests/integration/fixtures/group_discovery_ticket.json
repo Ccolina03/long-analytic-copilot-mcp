@@ -1,0 +1,9 @@
+{
+  "team": "mirrormaker",
+  "title": "MirrorCheckpointConnector group discovery is slow — 8-12s p99 on clusters with >10k consumer groups",
+  "description": "MirrorMaker 2 emits checkpoints so consumers can fail over from the source cluster to the target. MirrorCheckpointConnector.findConsumerGroups() must find every consumer group that consumes the topics being replicated, then translate their committed offsets into target-cluster offsets via OffsetSyncStore.\n\nObserved: a source cluster with 50,000 consumer groups takes 8-12 seconds to complete group discovery.\nThis runs on every emit.checkpoints.interval.seconds cycle (default 60s), so it burns a fifth of the budget every cycle.\nDuring an active failover it causes consumer lag spikes.\nThe Admin.listConsumerGroups() + describeConsumerGroups() fan-out generates a thundering herd across the __consumer_offsets coordinator shards.\n\nHypothesis: Kafka needs a reverse index from (topic, partition) to consumer group, exposed through a topic filter on ListGroups, instead of the current O(n_groups) scan.\n\nNeeds review from the group coordinator team (owns GroupMetadataManager), the broker team (owns KafkaApis request routing and the heap budget), and the clients team (protocol change likely needs a KIP).",
+  "priority": "high",
+  "labels": ["performance", "mirrormaker", "consumer-groups", "connect"],
+  "source": "jira",
+  "source_url": "https://issues.apache.org/jira/browse/KAFKA-18231"
+}

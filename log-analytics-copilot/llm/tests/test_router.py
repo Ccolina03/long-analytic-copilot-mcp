@@ -207,15 +207,15 @@ class TestDisableSwitch:
         self, clean_env, monkeypatch, all_providers
     ):
         monkeypatch.setenv("SME_LLM_DISABLE", "1")
-        r = ModelRouter(all_providers).resolve("deep", "oss-kafka")
+        r = ModelRouter(all_providers).resolve("deep", "kafka-clients")
         assert r.is_null
         assert "SME_LLM_DISABLE" in r.reason
 
 
 class TestPerAgentPinning:
     def test_pin_selects_the_named_model(self, clean_env, monkeypatch, all_providers):
-        monkeypatch.setenv("SME_LLM_MODEL_oss_kafka", "groq/llama-3.3-70b-versatile")
-        r = ModelRouter(all_providers).resolve("nano", "oss-kafka")
+        monkeypatch.setenv("SME_LLM_MODEL_kafka_clients", "groq/llama-3.3-70b-versatile")
+        r = ModelRouter(all_providers).resolve("nano", "kafka-clients")
         assert r.model.id == "llama-3.3-70b-versatile"
         assert "pinned" in r.reason
 
@@ -224,31 +224,31 @@ class TestPerAgentPinning:
     ):
         """An explicit pin is an instruction, not a suggestion."""
         monkeypatch.setenv("SME_LLM_PREFER_FREE", "1")
-        monkeypatch.setenv("SME_LLM_MODEL_oss_kafka", "deepseek/deepseek-v4-pro")
-        r = ModelRouter(all_providers).resolve("deep", "oss-kafka")
+        monkeypatch.setenv("SME_LLM_MODEL_kafka_clients", "deepseek/deepseek-v4-pro")
+        r = ModelRouter(all_providers).resolve("deep", "kafka-clients")
         assert r.model.id == "deepseek-v4-pro"
         assert not r.model.is_free
 
     def test_hyphenated_agent_id_maps_to_underscored_env_var(
         self, clean_env, monkeypatch, all_providers
     ):
-        monkeypatch.setenv("SME_LLM_MODEL_consumer_team", "groq/openai/gpt-oss-20b")
-        r = ModelRouter(all_providers).resolve("nano", "consumer-team")
+        monkeypatch.setenv("SME_LLM_MODEL_group_coordinator", "groq/openai/gpt-oss-20b")
+        r = ModelRouter(all_providers).resolve("nano", "group-coordinator")
         assert r.model.id == "openai/gpt-oss-20b"
 
     def test_pin_without_provider_prefix_still_resolves(
         self, clean_env, monkeypatch, all_providers
     ):
-        monkeypatch.setenv("SME_LLM_MODEL_kora_global", "deepseek-flash")
-        r = ModelRouter(all_providers).resolve("nano", "kora-global")
+        monkeypatch.setenv("SME_LLM_MODEL_mirrormaker", "deepseek-flash")
+        r = ModelRouter(all_providers).resolve("nano", "mirrormaker")
         assert r.model.id == "deepseek-flash"
 
     def test_unknown_pinned_model_degrades_to_null(
         self, clean_env, monkeypatch, all_providers
     ):
         """A typo must not silently fall back to a different model."""
-        monkeypatch.setenv("SME_LLM_MODEL_kora_global", "groq/gpt-42-turbo")
-        r = ModelRouter(all_providers).resolve("nano", "kora-global")
+        monkeypatch.setenv("SME_LLM_MODEL_mirrormaker", "groq/gpt-42-turbo")
+        r = ModelRouter(all_providers).resolve("nano", "mirrormaker")
         assert r.is_null
         assert "not in the registry" in r.reason
 
@@ -256,26 +256,26 @@ class TestPerAgentPinning:
         self, clean_env, monkeypatch, all_providers
     ):
         all_providers["deepseek"]._available = False
-        monkeypatch.setenv("SME_LLM_MODEL_kora_global", "deepseek/deepseek-v4-pro")
-        r = ModelRouter(all_providers).resolve("deep", "kora-global")
+        monkeypatch.setenv("SME_LLM_MODEL_mirrormaker", "deepseek/deepseek-v4-pro")
+        r = ModelRouter(all_providers).resolve("deep", "mirrormaker")
         assert r.is_null
         assert "unavailable" in r.reason
 
     def test_pin_for_one_agent_does_not_affect_another(
         self, clean_env, monkeypatch, all_providers
     ):
-        monkeypatch.setenv("SME_LLM_MODEL_oss_kafka", "deepseek/deepseek-v4-pro")
+        monkeypatch.setenv("SME_LLM_MODEL_kafka_clients", "deepseek/deepseek-v4-pro")
         router = ModelRouter(all_providers)
-        assert router.resolve("deep", "oss-kafka").model.id == "deepseek-v4-pro"
-        assert router.resolve("nano", "consumer-team").model.id != "deepseek-v4-pro"
+        assert router.resolve("deep", "kafka-clients").model.id == "deepseek-v4-pro"
+        assert router.resolve("nano", "group-coordinator").model.id != "deepseek-v4-pro"
 
 
 class TestPerAgentTierOverride:
     def test_tier_override_changes_the_requested_tier(
         self, clean_env, monkeypatch, hosted_only
     ):
-        monkeypatch.setenv("SME_LLM_TIER_consumer_team", "deep")
-        r = ModelRouter(hosted_only).resolve("nano", "consumer-team")
+        monkeypatch.setenv("SME_LLM_TIER_group_coordinator", "deep")
+        r = ModelRouter(hosted_only).resolve("nano", "group-coordinator")
         assert r.tier_requested == "deep"
         assert r.model.tier == "deep"
 
@@ -283,15 +283,15 @@ class TestPerAgentTierOverride:
         self, clean_env, monkeypatch, hosted_only
     ):
         """Lets you measure quality loss from running the org on cheap models."""
-        monkeypatch.setenv("SME_LLM_TIER_oss_kafka", "nano")
-        r = ModelRouter(hosted_only).resolve("deep", "oss-kafka")
+        monkeypatch.setenv("SME_LLM_TIER_kafka_clients", "nano")
+        r = ModelRouter(hosted_only).resolve("deep", "kafka-clients")
         assert r.tier_requested == "nano"
         assert r.model.blended_cost_per_mtok() < 0.2
 
     def test_bad_tier_override_raises(self, clean_env, monkeypatch, hosted_only):
-        monkeypatch.setenv("SME_LLM_TIER_oss_kafka", "enormous")
+        monkeypatch.setenv("SME_LLM_TIER_kafka_clients", "enormous")
         with pytest.raises(ValueError):
-            ModelRouter(hosted_only).resolve("deep", "oss-kafka")
+            ModelRouter(hosted_only).resolve("deep", "kafka-clients")
 
 
 class TestCostCap:
@@ -359,6 +359,6 @@ class TestDefaultRouter:
 
     def test_default_router_works_with_no_keys_configured(self, clean_env):
         """Must not raise in a bare environment — the common first-run case."""
-        result = default_router().resolve("standard", "kora-global")
+        result = default_router().resolve("standard", "mirrormaker")
         assert result is not None
         assert isinstance(result.reason, str) and result.reason

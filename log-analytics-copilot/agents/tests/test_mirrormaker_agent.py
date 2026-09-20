@@ -1,16 +1,17 @@
 """
-Phase 5 / kora-global agent tests.
+Phase 5 / mirrormaker agent tests.
 
 Covers the four tools, the three design alternatives, and the OwnTicket
-deliberation flow against real peer agents.
+deliberation flow against all three real peer agents.
 """
 
 import pytest
 
 from agents.base_agent import DirectTransport, NullTransport
-from agents.consumer_team_agent import ConsumerTeamAgent
-from agents.kora_global_agent import KoraGlobalAgent
-from agents.oss_kafka_agent import OssKafkaAgent
+from agents.group_coordinator_agent import GroupCoordinatorAgent
+from agents.kafka_broker_agent import KafkaBrokerAgent
+from agents.mirrormaker_agent import MirrorMakerAgent
+from agents.kafka_clients_agent import KafkaClientsAgent
 from agents.ownership_validator import validate_citations
 from proto.sme_agents import Ticket
 
@@ -18,11 +19,12 @@ from proto.sme_agents import Ticket
 @pytest.fixture
 def ticket():
     return Ticket.new(
-        team="kora-global",
-        title="clampOffsets is slow on orders topic",
+        team="mirrormaker",
+        title="MirrorCheckpointConnector group discovery is slow on orders topic",
         description=(
-            "clampOffsets p99 = 11.4s on cluster with 50k consumer groups. "
-            "Traced to O(n_groups) listGroups + describeGroups fan-out."
+            "Checkpoint group discovery p99 = 11.4s on a cluster with 50k consumer "
+            "groups. Traced to an O(n_groups) listConsumerGroups + "
+            "describeConsumerGroups fan-out."
         ),
         priority="high",
     )
@@ -30,72 +32,80 @@ def ticket():
 
 @pytest.fixture
 def full_network():
-    """kora-global wired to real consumer-team, which is wired to real oss-kafka."""
-    oss = OssKafkaAgent()
-    consumer = ConsumerTeamAgent(transport=DirectTransport({"oss-kafka": oss}))
-    kora = KoraGlobalAgent(
-        transport=DirectTransport({"consumer-team": consumer, "oss-kafka": oss})
+    """mirrormaker wired to all three real peers.
+
+    group-coordinator gets its own transport because it consults kafka-clients
+    on its own initiative.
+    """
+    clients = KafkaClientsAgent()
+    broker = KafkaBrokerAgent()
+    coordinator = GroupCoordinatorAgent(
+        transport=DirectTransport({"kafka-clients": clients})
     )
-    return kora
+    return MirrorMakerAgent(transport=DirectTransport({
+        "group-coordinator": coordinator,
+        "kafka-broker": broker,
+        "kafka-clients": clients,
+    }))
 
 
 # ------------------------------------------------------------------
 # Tools
 # ------------------------------------------------------------------
 
-class TestKoraTools:
+class TestMirrorMakerTools:
     def setup_method(self):
-        self.agent = KoraGlobalAgent()
+        self.agent = MirrorMakerAgent()
 
-    def test_get_failover_latency_returns_documented_shape(self):
-        r = self.agent.get_failover_latency("orders")
+    def test_get_checkpoint_latency_returns_documented_shape(self):
+        r = self.agent.get_checkpoint_latency("orders")
         for key in ("topic", "p50_ms", "p95_ms", "p99_ms", "bottleneck_phase", "bottleneck_pct"):
             assert key in r
 
-    def test_get_failover_latency_requires_topic(self):
+    def test_get_checkpoint_latency_requires_topic(self):
         with pytest.raises(ValueError, match="topic is required"):
-            self.agent.get_failover_latency("")
+            self.agent.get_checkpoint_latency("")
 
-    def test_get_failover_latency_requires_positive_hours(self):
+    def test_get_checkpoint_latency_requires_positive_hours(self):
         with pytest.raises(ValueError):
-            self.agent.get_failover_latency("orders", last_hours=0)
+            self.agent.get_checkpoint_latency("orders", last_hours=0)
 
     def test_clamp_trace_phases_sum_to_total_ms(self):
-        r = self.agent.get_offset_clamp_trace("orders", 3)
+        r = self.agent.get_group_discovery_trace("orders")
         assert r["total_ms"] == sum(p["ms"] for p in r["phases"])
 
     def test_clamp_trace_has_four_phases(self):
-        assert len(self.agent.get_offset_clamp_trace("orders", 3)["phases"]) == 4
+        assert len(self.agent.get_group_discovery_trace("orders")["phases"]) == 4
 
     def test_clamp_trace_shows_tiny_match_rate(self):
         """The whole argument rests on matched << scanned."""
-        r = self.agent.get_offset_clamp_trace("orders", 3)
+        r = self.agent.get_group_discovery_trace("orders")
         scanned = r["phases"][0]["groups_returned"]
         matched = r["phases"][2]["groups_matched"]
         assert matched < scanned / 1000
 
-    def test_list_active_links_returns_links_with_state(self):
-        links = self.agent.list_active_links()
-        assert len(links) >= 1
-        assert all("state" in l and "link_id" in l for l in links)
+    def test_list_replication_flows_returns_flows_with_state(self):
+        flows = self.agent.list_replication_flows()
+        assert len(flows) >= 1
+        assert all("state" in f and "flow_id" in f for f in flows)
 
-    def test_get_consumer_groups_for_link_shows_terrible_efficiency(self):
-        r = self.agent.get_consumer_groups_for_link("us-east-1-to-eu-west-1")
+    def test_get_group_discovery_cost_shows_terrible_efficiency(self):
+        r = self.agent.get_group_discovery_cost("us-east-1->eu-west-1")
         assert r["efficiency_pct"] < 1.0
 
-    def test_get_consumer_groups_for_link_requires_link_id(self):
+    def test_get_group_discovery_cost_requires_flow_id(self):
         with pytest.raises(ValueError):
-            self.agent.get_consumer_groups_for_link("")
+            self.agent.get_group_discovery_cost("")
 
 
 # ------------------------------------------------------------------
 # Design alternatives
 # ------------------------------------------------------------------
 
-class TestKoraAlternatives:
+class TestMirrorMakerAlternatives:
     def setup_method(self):
-        self.agent = KoraGlobalAgent()
-        ticket = Ticket.new(team="kora-global", title="t", description="d")
+        self.agent = MirrorMakerAgent()
+        ticket = Ticket.new(team="mirrormaker", title="t", description="d")
         self.investigation = self.agent._investigate(ticket)
         self.alts = self.agent._propose_alternatives(ticket, self.investigation)
 
@@ -105,8 +115,8 @@ class TestKoraAlternatives:
     def test_labels_are_a_b_c(self):
         assert [a.label for a in self.alts] == ["A", "B", "C"]
 
-    def test_all_proposed_by_kora_global(self):
-        assert all(a.proposed_by == "kora-global" for a in self.alts)
+    def test_all_proposed_by_mirrormaker(self):
+        assert all(a.proposed_by == "mirrormaker" for a in self.alts)
 
     def test_every_alternative_has_substantive_pros_and_cons(self):
         for alt in self.alts:
@@ -134,11 +144,11 @@ class TestKoraAlternatives:
 # Investigation content for the 1-pager
 # ------------------------------------------------------------------
 
-class TestKoraInvestigation:
+class TestMirrorMakerInvestigation:
     def setup_method(self):
-        self.agent = KoraGlobalAgent()
+        self.agent = MirrorMakerAgent()
         self.inv = self.agent._investigate(
-            Ticket.new(team="kora-global", title="t", description="d")
+            Ticket.new(team="mirrormaker", title="t", description="d")
         )
 
     def test_root_cause_explains_the_missing_reverse_index(self):
@@ -164,22 +174,23 @@ class TestKoraInvestigation:
 # OwnTicket deliberation
 # ------------------------------------------------------------------
 
-class TestKoraOwnTicket:
-    def test_consults_both_consumer_team_and_oss_kafka(self, full_network, ticket):
+class TestMirrorMakerOwnTicket:
+    def test_consults_all_three_peer_teams(self, full_network, ticket):
         finding = full_network.own_ticket(ticket)
         consulted = {r.to_agent for r in finding.deliberation}
-        assert "consumer-team" in consulted
-        assert "oss-kafka" in consulted
+        assert "group-coordinator" in consulted
+        assert "kafka-broker" in consulted
+        assert "kafka-clients" in consulted
 
     def test_deliberates_over_multiple_rounds(self, full_network, ticket):
         finding = full_network.own_ticket(ticket)
         assert finding.rounds_used >= 2, (
-            "consumer-team raises concerns in round 1, so round 1 cannot converge"
+            "group-coordinator raises concerns in round 1, so round 1 cannot converge"
         )
 
     def test_converges_within_the_round_cap(self, full_network, ticket):
         finding = full_network.own_ticket(ticket)
-        assert finding.rounds_used <= KoraGlobalAgent.MAX_DELIBERATION_ROUNDS
+        assert finding.rounds_used <= MirrorMakerAgent.MAX_DELIBERATION_ROUNDS
 
     def test_produces_a_recommendation(self, full_network, ticket):
         finding = full_network.own_ticket(ticket)
@@ -187,22 +198,23 @@ class TestKoraOwnTicket:
 
     def test_cited_codepaths_all_pass_ownership_validation(self, full_network, ticket):
         finding = full_network.own_ticket(ticket)
-        results = validate_citations(finding.cited_codepaths, KoraGlobalAgent.OWNS)
+        results = validate_citations(finding.cited_codepaths, MirrorMakerAgent.OWNS)
         unowned = [r.codepath for r in results if not r.owned]
         assert unowned == []
 
-    def test_teams_involved_includes_all_three_plus_broker_team(self, full_network, ticket):
+    def test_teams_involved_includes_all_four_teams(self, full_network, ticket):
         finding = full_network.own_ticket(ticket)
         teams = {t.team for t in finding.teams_involved}
-        assert {"kora-global", "consumer-team", "oss-kafka"} <= teams
-        assert "broker-team" in teams, "broker-team must be notified about the heap increase"
+        assert {"mirrormaker", "group-coordinator", "kafka-broker",
+                "kafka-clients"} <= teams
 
     def test_testing_strategy_aggregates_from_all_participants(self, full_network, ticket):
         finding = full_network.own_ticket(ticket)
         joined = " ".join(finding.testing_strategy)
-        assert "kora-global" in joined
-        assert "consumer-team" in joined
-        assert "oss-kafka" in joined
+        assert "mirrormaker" in joined
+        assert "group-coordinator" in joined
+        assert "kafka-broker" in joined
+        assert "kafka-clients" in joined
 
     def test_requires_human_only_for_the_apache_vote(self, full_network, ticket):
         """The single legitimate escalation is the PMC vote, nothing else."""
@@ -213,7 +225,7 @@ class TestKoraOwnTicket:
         assert "pmc" in point or "vote" in point
 
     def test_unreachable_peers_escalate(self, ticket):
-        agent = KoraGlobalAgent(transport=NullTransport())
+        agent = MirrorMakerAgent(transport=NullTransport())
         finding = agent.own_ticket(ticket)
         assert finding.requires_human is True
         assert any("Could not reach" in p for p in finding.human_decision_points)

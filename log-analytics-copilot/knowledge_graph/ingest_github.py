@@ -19,8 +19,8 @@ Supported input formats
 2. Agent manifest format (runbook OWNS lists)::
 
        OWNS = [
-           "confluent/kora-cluster-linking/src/",
-           "OffsetClampingService.java",
+           "connect/mirror/src/main/java/org/apache/kafka/connect/mirror/",
+           "MirrorCheckpointConnector.java",
        ]
 
 Both produce ``(team_entity) --owns--> (codepath_entity)`` edges.
@@ -225,7 +225,7 @@ def _main(argv: list[str] | None = None) -> None:  # pragma: no cover
     if args.agent_manifests:
         root = pathlib.Path(args.agent_manifests)
         for md_file in sorted(root.glob("*.md")):
-            agent_id = md_file.stem  # e.g. "kora-global-sme" → use as agent id
+            agent_id = md_file.stem  # e.g. "mirrormaker-sme" → use as agent id
             text = md_file.read_text()
             n = ingest_runbook(conn, text, agent_id=agent_id, source=str(md_file), dry_run=args.dry_run)
             print(f"Ingested {n} ownership edges from {md_file.name}")

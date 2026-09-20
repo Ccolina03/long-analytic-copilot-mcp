@@ -1,5 +1,5 @@
 """
-Phase 5 / oss-kafka agent tests.
+Phase 5 / kafka-clients agent tests.
 
 Covers the four tools, the three protocol-surface alternatives, and the one
 legitimate organizational-authority escalation on this ticket (the Apache
@@ -8,20 +8,20 @@ PMC vote) — including that it correctly identifies the unblocking path.
 
 import pytest
 
-from agents.oss_kafka_agent import OssKafkaAgent
+from agents.kafka_clients_agent import KafkaClientsAgent
 from agents.ownership_validator import validate_citations
 from proto.sme_agents import ImpactRequest
 
 
 @pytest.fixture
 def agent():
-    return OssKafkaAgent()
+    return KafkaClientsAgent()
 
 
 def _request(round_number: int = 1) -> ImpactRequest:
     return ImpactRequest.new(
-        from_agent="consumer-team",
-        to_agent="oss-kafka",
+        from_agent="group-coordinator",
+        to_agent="kafka-clients",
         ticket_id="t-oss-1",
         request_type="protocol_review",
         context="Proposing ListGroupsRequest v5 with a topic_partitions filter field.",
@@ -36,7 +36,7 @@ def _request(round_number: int = 1) -> ImpactRequest:
 # Tools
 # ------------------------------------------------------------------
 
-class TestOssKafkaTools:
+class TestKafkaClientsTools:
     def test_search_kips_ranks_kip_518_first(self, agent):
         results = agent.search_kips("ListGroups topic partition filter")
         assert results[0]["kip"] == "KIP-518"
@@ -56,15 +56,15 @@ class TestOssKafkaTools:
     def test_api_spec_returns_listgroups_history(self, agent):
         spec = agent.get_api_spec("LISTGROUPS")
         assert spec["api_key"] == 16
-        assert spec["current_max_version"] == 4
+        assert spec["current_max_version"] == 5
         assert 4 in [v["version"] for v in spec["versions"]]
 
     def test_api_spec_reports_flexible_since_v3(self, agent):
         """This is why tagged fields are safe — it's load-bearing for the design."""
         assert agent.get_api_spec("LISTGROUPS")["flexible_since_version"] == 3
 
-    def test_api_spec_includes_proposed_v5_field(self, agent):
-        assert "topic_partitions" in agent.get_api_spec("LISTGROUPS")["proposed_v5_field"]
+    def test_api_spec_includes_proposed_v6_field(self, agent):
+        assert "topic_partitions" in agent.get_api_spec("LISTGROUPS")["proposed_v6_field"]
 
     def test_api_spec_handles_unknown_api(self, agent):
         spec = agent.get_api_spec("NotARealApi")
@@ -98,22 +98,22 @@ class TestOssKafkaTools:
 # Protocol alternatives
 # ------------------------------------------------------------------
 
-class TestOssKafkaAlternatives:
+class TestKafkaClientsAlternatives:
     def setup_method(self):
-        a = OssKafkaAgent()
+        a = KafkaClientsAgent()
         self.alts = a._protocol_alternatives(
             a.get_api_spec("LISTGROUPS"),
-            a.check_compat(16, 5, ["topic_partitions"]),
+            a.check_compat(16, 6, ["topic_partitions"]),
         )
 
     def test_proposes_exactly_three(self):
         assert len(self.alts) == 3
 
-    def test_spans_versioned_field_new_api_and_internal_only(self):
+    def test_spans_versioned_field_new_api_key_and_client_side_only(self):
         names = " ".join(a.name.lower() for a in self.alts)
-        assert "v5" in names
+        assert "v6" in names
         assert "api key" in names
-        assert "internal" in names
+        assert "adminclient" in names
 
     def test_every_alternative_has_depth(self):
         for alt in self.alts:
@@ -121,26 +121,29 @@ class TestOssKafkaAlternatives:
             assert len(alt.cons) >= 3
             assert len(alt.approach) > 150
 
-    def test_v5_field_cites_kip_518_precedent(self):
+    def test_v6_field_cites_kip_518_precedent(self):
         joined = " ".join(self.alts[0].pros)
         assert "KIP-518" in joined
+        assert "KIP-848" in joined
 
-    def test_internal_only_option_names_the_fork_risk(self):
+    def test_client_side_only_option_admits_it_does_not_fix_the_cost(self):
+        """The honest objection to a convenience wrapper: it renames the problem."""
         joined = " ".join(self.alts[2].cons).lower()
-        assert "fork" in joined
+        assert "o(n_groups)" in joined
+        assert "does not fix" in joined
 
 
 # ------------------------------------------------------------------
 # ConsultAbout
 # ------------------------------------------------------------------
 
-class TestOssKafkaConsultAbout:
-    def test_recommends_the_v5_tagged_field(self, agent):
+class TestKafkaClientsConsultAbout:
+    def test_recommends_the_v6_tagged_field(self, agent):
         resp = agent.consult_about(_request(1), depth=1)
-        assert "v5" in resp.recommendation
+        assert "v6" in resp.recommendation
         recommended = [a for a in resp.design_alternatives if a.recommended]
         assert len(recommended) == 1
-        assert "v5" in recommended[0].name
+        assert "v6" in recommended[0].name
 
     def test_rules_out_the_other_two_with_reasons(self, agent):
         resp = agent.consult_about(_request(1), depth=1)
@@ -187,7 +190,7 @@ class TestOssKafkaConsultAbout:
 
     def test_cites_only_codepaths_it_owns(self, agent):
         resp = agent.consult_about(_request(1), depth=1)
-        results = validate_citations(resp.cited_codepaths, OssKafkaAgent.OWNS)
+        results = validate_citations(resp.cited_codepaths, KafkaClientsAgent.OWNS)
         assert [r.codepath for r in results if not r.owned] == []
 
     def test_supplies_protocol_test_requirements(self, agent):

@@ -40,13 +40,13 @@ Core workflows
 
 Subclass example::
 
-    class KoraGlobalAgent(SMEAgentBase):
-        AGENT_NAME = "kora-global"
-        DOMAIN     = "Cluster Linking — failover, offset clamping, mirror ops"
-        OWNS       = ["OffsetClampingService.java", "FailoverCoordinator.java"]
+    class MirrorMakerAgent(SMEAgentBase):
+        AGENT_NAME = "mirrormaker"
+        DOMAIN     = "MirrorMaker 2 — async cross-cluster replication, checkpointing"
+        OWNS       = ["MirrorCheckpointConnector.java", "OffsetSyncStore.java"]
 
-        @tool("get_failover_latency")
-        def get_failover_latency(self, topic: str, last_hours: int = 24) -> dict:
+        @tool("get_checkpoint_latency")
+        def get_checkpoint_latency(self, topic: str, last_hours: int = 24) -> dict:
             ...
 """
 
@@ -189,7 +189,7 @@ class SMEAgentBase:
     """Base class for every SME agent.
 
     Subclasses must define:
-        AGENT_NAME  str   — unique identifier (e.g. "kora-global")
+        AGENT_NAME  str   — unique identifier (e.g. "mirrormaker")
         DOMAIN      str   — plain English description of what this team owns
         OWNS        list  — list of file path prefixes / exact names this
                             agent is authoritative over

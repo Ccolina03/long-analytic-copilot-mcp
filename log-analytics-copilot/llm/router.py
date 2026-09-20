@@ -4,7 +4,7 @@ Model router: resolve a capability tier to the cheapest available model.
 Resolution order for an agent asking for tier T:
 
 1. **Explicit per-agent pin.**  ``SME_LLM_MODEL_<agent_id>=provider/model``
-   wins outright. Escape hatch for "the oss-kafka agent must use this model".
+   wins outright. Escape hatch for "the kafka-clients agent must use this model".
 2. **Free local first**, if ``SME_LLM_PREFER_FREE`` is set (the default).
    A local Ollama model at $0.00 beats any hosted model on cost.
 3. **Cheapest available hosted model** at tier T, ranked on blended cost.
@@ -23,7 +23,7 @@ Environment variables
   ``SME_LLM_MAX_COST_PER_MTOK``  Refuse models above this blended cost
   ``SME_LLM_DISABLE``            Set to "1" to force NullLLM everywhere
 
-Agent ids contain hyphens (``oss-kafka``); env var names cannot, so hyphens
+Agent ids contain hyphens (``kafka-clients``); env var names cannot, so hyphens
 map to underscores: ``SME_LLM_MODEL_oss_kafka``.
 """
 

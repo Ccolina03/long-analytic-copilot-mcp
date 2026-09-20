@@ -9,7 +9,7 @@ kafka-console-producer.sh -- no extra dependencies, stdlib only.
 Example
 -------
     python3 scripts/produce-fake-logs.py --count 1000 --seed 42 \\
-      | docker exec -i lac-kafka /opt/bitnami/kafka/bin/kafka-console-producer.sh \\
+      | docker exec -i lac-kafka /opt/kafka/bin/kafka-console-producer.sh \\
           --bootstrap-server localhost:9092 \\
           --topic logs.raw
 

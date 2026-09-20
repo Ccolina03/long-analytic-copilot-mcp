@@ -7,7 +7,7 @@ Tests
   test_router_maps_team_name_to_correct_agent_address
   test_router_returns_400_for_missing_team
   test_router_returns_422_for_unknown_team
-  test_router_accepts_kora_global_ticket
+  test_router_accepts_mirrormaker_ticket
   test_health_endpoint_returns_known_teams
   test_normalize_github_issue_webhook_preserves_team_label
   test_normalize_jira_webhook_preserves_team_field
@@ -36,13 +36,13 @@ client = TestClient(app)
 class TestNormalizeTicket:
     def test_extracts_team_field_from_raw_json(self):
         payload = {
-            "team": "kora-global",
-            "title": "clampOffsets slow",
+            "team": "mirrormaker",
+            "title": "checkpoint group discovery slow",
             "description": "p99=11s",
         }
         ticket = normalize_ticket(payload)
-        assert ticket.team == "kora-global"
-        assert ticket.title == "clampOffsets slow"
+        assert ticket.team == "mirrormaker"
+        assert ticket.title == "checkpoint group discovery slow"
 
     def test_missing_team_raises_key_error(self):
         with pytest.raises(KeyError):
@@ -57,48 +57,48 @@ class TestNormalizeTicket:
             "action": "opened",
             "issue": {
                 "title": "Failover latency spike",
-                "body": "clampOffsets is slow",
+                "body": "checkpoint group discovery is slow",
                 "html_url": "https://github.com/org/repo/issues/1",
                 "labels": [
-                    {"name": "team: kora-global"},
+                    {"name": "team: mirrormaker"},
                     {"name": "priority: high"},
                 ],
             },
         }
         ticket = normalize_ticket(payload)
-        assert ticket.team == "kora-global"
+        assert ticket.team == "mirrormaker"
         assert ticket.source == "github"
 
     def test_normalize_jira_webhook_preserves_team_field(self):
         payload = {
             "issue": {
-                "self": "https://jira.example.com/rest/api/2/issue/KORA-123",
+                "self": "https://jira.example.com/rest/api/2/issue/KAFKA-18231",
                 "fields": {
-                    "summary": "clampOffsets p99 spike",
+                    "summary": "checkpoint group discovery p99 spike",
                     "description": "8-12s on large clusters",
                     "priority": {"name": "High"},
-                    "team": {"name": "kora-global"},
+                    "team": {"name": "mirrormaker"},
                 },
             },
         }
         ticket = normalize_ticket(payload)
-        assert ticket.team == "kora-global"
+        assert ticket.team == "mirrormaker"
         assert ticket.source == "jira"
 
     def test_ticket_has_auto_generated_id(self):
-        ticket = normalize_ticket({"team": "kora-global", "title": "t"})
+        ticket = normalize_ticket({"team": "mirrormaker", "title": "t"})
         assert ticket.ticket_id
         assert len(ticket.ticket_id) > 0
 
 
 class TestGetAgentAddress:
-    def test_maps_kora_global_to_correct_address(self):
-        addr = get_agent_address("kora-global")
+    def test_maps_mirrormaker_to_correct_address(self):
+        addr = get_agent_address("mirrormaker")
         assert addr is not None
-        assert "kora" in addr or "8001" in addr
+        assert "mirrormaker" in addr or "8001" in addr
 
     def test_maps_consumer_team_to_correct_address(self):
-        addr = get_agent_address("consumer-team")
+        addr = get_agent_address("group-coordinator")
         assert addr is not None
 
     def test_returns_none_for_unknown_team(self):
@@ -119,20 +119,20 @@ class TestHealthEndpoint:
         resp = client.get("/health")
         data = resp.json()
         assert "known_teams" in data
-        assert "kora-global" in data["known_teams"]
-        assert "consumer-team" in data["known_teams"]
+        assert "mirrormaker" in data["known_teams"]
+        assert "group-coordinator" in data["known_teams"]
 
 
 class TestSubmitTicket:
-    def test_accepts_kora_global_ticket_with_202(self):
+    def test_accepts_mirrormaker_ticket_with_202(self):
         resp = client.post("/tickets", json={
-            "team": "kora-global",
-            "title": "clampOffsets slow",
+            "team": "mirrormaker",
+            "title": "checkpoint group discovery slow",
             "description": "p99=11s",
         })
         assert resp.status_code == 202
         data = resp.json()
-        assert data["routed_to"] == "kora-global"
+        assert data["routed_to"] == "mirrormaker"
         assert data["status"] == "accepted"
         assert "ticket_id" in data
 
@@ -151,33 +151,33 @@ class TestSubmitTicket:
 
     def test_router_routes_to_correct_agent_address(self):
         resp = client.post("/tickets", json={
-            "team": "consumer-team",
+            "team": "group-coordinator",
             "title": "group state issue",
         })
         assert resp.status_code == 202
-        assert resp.json()["routed_to"] == "consumer-team"
+        assert resp.json()["routed_to"] == "group-coordinator"
 
     def test_router_does_no_domain_classification(self):
         """Submitting without a team must ALWAYS fail, even for obvious content."""
         resp = client.post("/tickets", json={
             "title": "GroupCoordinator rebalance loop",
-            "description": "this is clearly a consumer-team issue but has no team field",
+            "description": "this is clearly a group-coordinator issue but has no team field",
         })
         # Must still return 400 — no guessing
         assert resp.status_code == 400
 
     def test_consumer_team_ticket_routed_correctly(self):
         resp = client.post("/tickets", json={
-            "team": "consumer-team",
+            "team": "group-coordinator",
             "title": "rebalance storm on checkout topic",
         })
         assert resp.status_code == 202
-        assert resp.json()["routed_to"] == "consumer-team"
+        assert resp.json()["routed_to"] == "group-coordinator"
 
     def test_oss_kafka_ticket_routed_correctly(self):
         resp = client.post("/tickets", json={
-            "team": "oss-kafka",
+            "team": "kafka-clients",
             "title": "KIP-518 edge case",
         })
         assert resp.status_code == 202
-        assert resp.json()["routed_to"] == "oss-kafka"
+        assert resp.json()["routed_to"] == "kafka-clients"

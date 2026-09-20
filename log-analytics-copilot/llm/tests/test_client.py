@@ -49,15 +49,15 @@ def router_with(scripted: ScriptedProvider | FailingProvider) -> ModelRouter:
 
 class TestDisabledPath:
     def test_no_providers_means_not_enabled(self):
-        llm = AgentLLM("kora-global", router=ModelRouter({}))
+        llm = AgentLLM("mirrormaker", router=ModelRouter({}))
         assert not llm.enabled
 
     def test_reason_returns_none_when_no_model(self):
-        llm = AgentLLM("kora-global", router=ModelRouter({}))
+        llm = AgentLLM("mirrormaker", router=ModelRouter({}))
         assert llm.reason(role_prompt="you are an agent", question="hi") is None
 
     def test_reason_json_returns_none_when_no_model(self):
-        llm = AgentLLM("kora-global", router=ModelRouter({}))
+        llm = AgentLLM("mirrormaker", router=ModelRouter({}))
         assert llm.reason_json(role_prompt="r", question="q") is None
 
     def test_no_cost_incurred_when_disabled(self):
@@ -71,7 +71,7 @@ class TestDisabledPath:
 class TestSuccessPath:
     def test_returns_model_text(self):
         scripted = ScriptedProvider(["the index should be lazily built"])
-        llm = AgentLLM("consumer-team", tier="nano", router=router_with(scripted))
+        llm = AgentLLM("group-coordinator", tier="nano", router=router_with(scripted))
         assert llm.reason(role_prompt="r", question="q") == "the index should be lazily built"
 
     def test_enabled_is_true(self):
@@ -117,8 +117,8 @@ class TestPromptConstruction:
     def test_role_prompt_is_the_system_message(self):
         scripted = ScriptedProvider()
         llm = AgentLLM("a", tier="nano", router=router_with(scripted))
-        llm.reason(role_prompt="You are the oss-kafka SME.", question="q")
-        assert "You are the oss-kafka SME." in scripted.system_prompt()
+        llm.reason(role_prompt="You are the kafka-clients SME.", question="q")
+        assert "You are the kafka-clients SME." in scripted.system_prompt()
 
     def test_stable_context_goes_in_the_system_message(self):
         """Cache prefixes match on the system message, so this must land there."""
@@ -191,11 +191,11 @@ class TestTierEscalation:
 class TestBudgetIntegration:
     def test_successful_call_is_recorded(self):
         budget = TicketBudget("T-1")
-        llm = AgentLLM("consumer-team", tier="nano",
+        llm = AgentLLM("group-coordinator", tier="nano",
                        router=router_with(ScriptedProvider(["ok"])), budget=budget)
         llm.reason(role_prompt="r", question="q", purpose="verdict")
         assert budget.call_count == 1
-        assert budget.calls[0].agent_id == "consumer-team"
+        assert budget.calls[0].agent_id == "group-coordinator"
         assert budget.calls[0].purpose == "verdict"
 
     def test_exhausted_budget_skips_the_call_entirely(self):

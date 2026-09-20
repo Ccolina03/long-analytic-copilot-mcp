@@ -1,8 +1,9 @@
 """
-Consumer Team SME Agent — Principal Engineer, GroupCoordinator.
+Group Coordinator SME Agent — Principal Engineer, consumer group coordination.
 
-Domain: Consumer groups, GroupCoordinator, offset storage, rebalancing.
-Runbook: runbooks/consumer-team-sme.md
+Domain: Consumer groups, the group-coordinator module, offset storage,
+rebalancing (classic and KIP-848 consumer protocols).
+Runbook: runbooks/group-coordinator-sme.md
 
 Tools
 -----
@@ -14,34 +15,35 @@ Tools
 
 Behaviour
 ---------
-When kora-global consults it, this agent does real diligence: it validates the
-memory cost with its own tool, corrects kora-global's alternative B on a
+When mirrormaker consults it, this agent does real diligence: it validates the
+memory cost with its own tool, corrects mirrormaker's alternative B on a
 genuine correctness point (committed offsets are not live subscriptions), and
-proposes three implementation alternatives for the index itself.  It consults
-oss-kafka on its own initiative about the protocol surface.  It moves to
+proposes three implementation alternatives for the index itself. It consults
+kafka-clients on its own initiative about the protocol surface. It moves to
 'agreed' only once its concerns have been folded in.
 """
 
 from __future__ import annotations
 
-from typing import Any
-
 from agents.base_agent import SMEAgentBase, tool
-from proto.sme_agents import DesignAlternative, ImpactRequest, ImpactResponse, Ticket
+from proto.sme_agents import DesignAlternative, ImpactRequest, ImpactResponse
 
 
-class ConsumerTeamAgent(SMEAgentBase):
-    AGENT_NAME = "consumer-team"
-    DOMAIN = "Consumer groups, GroupCoordinator, offset storage, rebalancing"
+class GroupCoordinatorAgent(SMEAgentBase):
+    AGENT_NAME = "group-coordinator"
+    DOMAIN = (
+        "Consumer groups, group coordination, offset storage, rebalancing "
+        "(classic and KIP-848 consumer protocols)"
+    )
     OWNS = [
-        "apache/kafka/core/src/main/scala/kafka/coordinator/group/",
-        "GroupCoordinator.scala",
-        "GroupMetadata.scala",
-        "GroupCoordinatorAdapter.scala",
-        "GroupCoordinatorConfig.scala",
-        "confluent/kora-group-coordinator/",
-        "KoraGroupCoordinator.java",
-        "KoraGroupMetadataManager.java",
+        "group-coordinator/src/main/java/org/apache/kafka/coordinator/group/",
+        "GroupMetadataManager.java",
+        "GroupCoordinatorService.java",
+        "GroupCoordinatorShard.java",
+        "GroupCoordinatorConfig.java",
+        "OffsetMetadataManager.java",
+        "ConsumerGroup.java",
+        "ClassicGroup.java",
         "TopicPartitionGroupIndex.java",
     ]
 
@@ -62,9 +64,10 @@ class ConsumerTeamAgent(SMEAgentBase):
         return {
             "group_id": group_id,
             "state": "Stable",
+            "group_type": "consumer",
             "member_count": 6,
             "subscribed_topics": ["orders", "payments", "refunds"],
-            "coordinator_broker": 12,
+            "coordinator_shard": 12,
             "last_rebalance_ms_ago": 840000,
         }
 
@@ -95,7 +98,7 @@ class ConsumerTeamAgent(SMEAgentBase):
     def get_offset_storage_schema(self) -> dict:
         """Return the __consumer_offsets key/value schema."""
         return {
-            "key_format": "(group_id: string, topic: string, partition: int16)",
+            "key_format": "(group_id: string, topic: string, partition: int32)",
             "value_format": "(offset: int64, metadata: string, commit_timestamp: int64)",
             "num_partitions": 50,
             "total_records_sample_cluster": 2_400_000,
@@ -115,16 +118,16 @@ class ConsumerTeamAgent(SMEAgentBase):
         bytes_per_entry = 36
         total_bytes = entries * bytes_per_entry
         total_mb = total_bytes / (1024 * 1024)
-        per_coordinator_mb = total_mb / 50
+        per_shard_mb = total_mb / 50
         return {
             "group_count": group_count,
             "avg_subscriptions": avg_subscriptions_per_group,
             "entries": entries,
             "bytes_per_entry": bytes_per_entry,
             "total_mb": round(total_mb, 1),
-            "per_coordinator_mb": round(per_coordinator_mb, 2),
+            "per_shard_mb": round(per_shard_mb, 2),
             "assessment": (
-                "acceptable — p99 Kora cluster uses < 1% of coordinator heap"
+                "acceptable — under 1% of default broker heap"
                 if total_mb < 100 else
                 "WARNING — may require broker JVM heap increase"
             ),
@@ -148,41 +151,45 @@ class ConsumerTeamAgent(SMEAgentBase):
     # Implementation alternatives for the index itself
     # ------------------------------------------------------------------
 
-    def _index_alternatives(self, mem_cost: dict, rebalances: dict) -> list[DesignAlternative]:
-        """Three ways to actually build the reverse index inside GroupCoordinator."""
+    def _index_alternatives(
+        self, mem_cost: dict, rebalances: dict
+    ) -> list[DesignAlternative]:
+        """Three ways to actually build the reverse index inside the coordinator."""
         return [
             DesignAlternative(
                 label="A",
                 name="Eager in-memory HashMap maintained incrementally",
                 proposed_by=self.AGENT_NAME,
                 approach=(
-                    "Add `topicPartitionToGroups: Map<TopicPartition, Set<GroupId>>` "
-                    "alongside the existing `groupMetadataCache` in GroupCoordinator. "
-                    "Mutate it in `handleJoinGroup()` (line 312–401) when a member's "
-                    "subscription is set, and in `handleLeaveGroup()` (line 534–612) plus "
-                    "the heartbeat-timeout path when membership drops. On coordinator "
-                    "failover, rebuild by replaying `__consumer_offsets` for the owned "
-                    "partitions. `handleListGroups()` (line 702–798) checks the new filter "
-                    "field and serves from the index when present. New file "
+                    "Add `topicPartitionToGroups: Map<TopicPartition, Set<String>>` "
+                    "alongside the existing group metadata in GroupMetadataManager. Mutate "
+                    "it wherever subscriptions change: the classic JoinGroup path, the "
+                    "KIP-848 ConsumerGroupHeartbeat path, LeaveGroup, and the "
+                    "session-timeout eviction path. When a GroupCoordinatorShard loads its "
+                    "`__consumer_offsets` partition, rebuild the index from the replay it "
+                    "already performs. A filtered ListGroups request then serves from the "
+                    "index instead of walking every group. New file "
                     "`TopicPartitionGroupIndex.java` holds the structure and its metrics."
                 ),
                 pros=[
-                    f"O(1) reads — exactly what the failover path needs.",
+                    "O(1) reads — exactly what a cold-start failover path needs.",
                     f"Memory cost is measured, not guessed: {mem_cost['total_mb']}MB total "
                     f"for {mem_cost['group_count']:,} groups at "
                     f"{mem_cost['avg_subscriptions']} subscriptions each, which is "
-                    f"{mem_cost['per_coordinator_mb']}MB per coordinator partition.",
-                    f"Low GC pressure — entries mutate only on join/leave, and the measured "
-                    f"rebalance rate is {rebalances['rebalance_count']} per hour for a busy "
-                    f"topic, so churn is nowhere near hot-path frequency.",
+                    f"{mem_cost['per_shard_mb']}MB per coordinator shard.",
+                    f"Low GC pressure — entries mutate only on membership change, and the "
+                    f"measured rate is {rebalances['rebalance_count']} rebalances per hour "
+                    f"for a busy topic, nowhere near hot-path frequency.",
                     "The index is derived from live in-memory membership, so it reflects "
                     "actual subscriptions rather than committed offsets.",
                     "Simple enough to reason about correctness by inspection, which matters "
                     "for code every Kafka cluster in the world runs.",
+                    "Works identically for classic and KIP-848 consumer groups, because "
+                    "both funnel their subscription changes through this manager.",
                 ],
                 cons=[
-                    "Rebuild on coordinator failover costs roughly 800ms for 50k groups; "
-                    "requests during that window must fall back to the scan.",
+                    "Rebuild on shard load costs roughly 800ms for 50k groups; requests "
+                    "during that window must fall back to the scan.",
                     "Memory is proportional to *all* subscriptions, including topics nobody "
                     "ever queries by partition.",
                     "Unbounded if a pathological workload churns groups, so it needs a "
@@ -190,40 +197,40 @@ class ConsumerTeamAgent(SMEAgentBase):
                 ],
                 effort="M",
                 risk="low",
-                blast_radius=["consumer-team", "broker-team"],
+                blast_radius=["group-coordinator", "kafka-broker"],
             ),
             DesignAlternative(
                 label="B",
                 name="Lazy index computed on first query, with TTL and rebalance invalidation",
                 proposed_by=self.AGENT_NAME,
                 approach=(
-                    "Do not maintain an index eagerly. On the first "
-                    "`listGroups(topic_partitions=...)` call for a given topic-partition, "
-                    "compute the matching group set by scanning `groupMetadataCache` once, "
-                    "then cache the result with a TTL. Invalidate the cache entry whenever "
-                    "any group subscribed to that topic-partition rebalances."
+                    "Do not maintain an index eagerly. On the first filtered ListGroups "
+                    "call for a given topic-partition, compute the matching group set by "
+                    "scanning group metadata once, then cache the result with a TTL. "
+                    "Invalidate the cache entry whenever any group subscribed to that "
+                    "topic-partition rebalances."
                 ),
                 pros=[
                     "Memory is proportional to the topic-partitions actually queried, which "
-                    "for the failover use case is a tiny fraction of the cluster.",
-                    "No rebuild cost on coordinator failover — the cache simply starts cold.",
-                    "No write-path changes at all, so zero risk to the JoinGroup / "
-                    "LeaveGroup hot paths that every consumer depends on.",
+                    "for the replication use case is a tiny fraction of the cluster.",
+                    "No rebuild cost on shard load — the cache simply starts cold.",
+                    "No write-path changes at all, so zero risk to the JoinGroup and "
+                    "ConsumerGroupHeartbeat hot paths every consumer depends on.",
                 ],
                 cons=[
                     "The first query for any topic-partition is still O(n_groups), and "
                     "failover is precisely a cold-start event — the one case where the "
                     "cache is guaranteed to be empty. This misses the point of the ticket.",
-                    "Cache-stampede risk: a failover touching 142 mirrored topics would "
+                    "Cache-stampede risk: a failover touching 142 replicated topics would "
                     "issue 142 concurrent full scans.",
                     "Invalidation correctness is subtle and easy to get wrong — a missed "
-                    "invalidation silently returns a stale group set, and clamping against "
-                    "a stale set is a correctness bug, not a performance bug.",
+                    "invalidation silently returns a stale group set, and checkpointing "
+                    "against a stale set is a correctness bug, not a performance bug.",
                     "Unpredictable latency makes the p99 target essentially unachievable.",
                 ],
                 effort="M",
                 risk="high",
-                blast_radius=["consumer-team"],
+                blast_radius=["group-coordinator"],
             ),
             DesignAlternative(
                 label="C",
@@ -231,32 +238,33 @@ class ConsumerTeamAgent(SMEAgentBase):
                 proposed_by=self.AGENT_NAME,
                 approach=(
                     "Write reverse-index entries into the `__consumer_offsets` compacted "
-                    "topic as a new key type, so the index is durable and survives "
-                    "coordinator failover and broker restart with no replay-and-rebuild "
-                    "step. GroupCoordinator loads it directly as part of normal partition "
-                    "load."
+                    "topic as a new record type, so the index is durable and survives shard "
+                    "reassignment and broker restart with no replay-and-rebuild step. The "
+                    "coordinator loads it directly as part of normal partition load."
                 ),
                 pros=[
-                    "No rebuild cost on failover — the index is already durable, which "
+                    "No rebuild cost on shard load — the index is already durable, which "
                     "removes the 800ms fallback window from alternative A entirely.",
                     "Survives full broker restart, so cold-start behaviour is strictly "
                     "better than any in-memory option.",
                 ],
                 cons=[
-                    "Changes the `__consumer_offsets` schema, which is a far larger blast "
-                    "radius than the problem justifies — it is a public-ish format that "
-                    "tooling, backups, and every Kafka operator depends on.",
-                    "Write amplification on every join and leave, on the hot path, to "
-                    "optimize a cold path that runs during failover only.",
+                    "Changes the `__consumer_offsets` record schema, which is a far larger "
+                    "blast radius than the problem justifies — tooling, backups, and every "
+                    "Kafka operator depend on that format.",
+                    "Write amplification on every membership change, on the hot path, to "
+                    "optimize a cold path that runs during checkpointing only.",
                     "Log-compaction semantics for the new record type are genuinely tricky "
                     "to get right, and getting them wrong corrupts offset storage.",
                     "Needs its own KIP independent of the ListGroups change, with broker "
-                    "team and OSS sign-off — strictly more coordination than alternative A "
+                    "and client sign-off — strictly more coordination than alternative A "
                     "for strictly less benefit.",
                 ],
                 effort="XL",
                 risk="high",
-                blast_radius=["consumer-team", "broker-team", "oss-kafka", "operators"],
+                blast_radius=[
+                    "group-coordinator", "kafka-broker", "kafka-clients", "operators",
+                ],
             ),
         ]
 
@@ -267,7 +275,7 @@ class ConsumerTeamAgent(SMEAgentBase):
     def _handle_consultation(
         self, request: ImpactRequest, depth: int
     ) -> ImpactResponse:
-        """Do real diligence on kora-global's request, round by round."""
+        """Do real diligence on mirrormaker's request, round by round."""
         mem_cost = self.estimate_index_memory_cost(50_000, 8)
         rebalances = self.get_rebalance_history("orders")
         offset_schema = self.get_offset_storage_schema()
@@ -281,23 +289,24 @@ class ConsumerTeamAgent(SMEAgentBase):
             "exactly when it is needed. Does not meet the p99 target."
         )
         alternatives[2].rejected_reason = (
-            "Changing the __consumer_offsets schema is a disproportionate blast radius, "
-            "and it puts write amplification on the hot path to optimize a cold path."
+            "Changing the __consumer_offsets record schema is a disproportionate blast "
+            "radius, and it puts write amplification on the hot path to optimize a cold "
+            "path."
         )
 
         round_num = request.round_number
 
-        # --- consult oss-kafka on our own initiative, in round 1 ---
-        oss_response: ImpactResponse | None = None
+        # --- consult kafka-clients on our own initiative, in round 1 ---
+        clients_response: ImpactResponse | None = None
         if round_num == 1 and depth < self.MAX_CONSULTATION_DEPTH:
-            oss_request = ImpactRequest.new(
+            clients_request = ImpactRequest.new(
                 from_agent=self.AGENT_NAME,
-                to_agent="oss-kafka",
+                to_agent="kafka-clients",
                 ticket_id=request.ticket_id,
                 request_type="protocol_review",
                 context=(
                     "We can implement a reverse (topic, partition) → group index inside "
-                    "GroupCoordinator with acceptable memory cost "
+                    "GroupMetadataManager with acceptable memory cost "
                     f"({mem_cost['total_mb']}MB for 50k groups). The server side is ours. "
                     "What we do not own is the public API surface that lets a client ask "
                     "for a filtered list.\n\n"
@@ -305,95 +314,93 @@ class ConsumerTeamAgent(SMEAgentBase):
                 ),
                 question=(
                     "Does exposing a topic-partition filter on ListGroups require a KIP, "
-                    "and what is the right protocol shape — a v5 tagged field on "
-                    "ListGroupsRequest, a new API key, or a Confluent-internal extension? "
-                    "Also tell us what KIP-848 means for this, since new-protocol groups "
-                    "do not go through ListGroups the same way."
+                    "and what is the right protocol shape — a v6 tagged field on "
+                    "ListGroupsRequest or a new API key? Also tell us how the filter should "
+                    "behave for KIP-848 consumer groups versus classic groups, since they "
+                    "are described through different APIs."
                 ),
                 codepaths_of_interest=["ListGroupsRequest.json", "ApiKeys.java"],
                 proposed_change=(
-                    "ListGroupsRequest v5 with an optional topic_partitions filter field; "
+                    "ListGroupsRequest v6 with an optional topic_partitions filter field; "
                     "server routes to TopicPartitionGroupIndex when the field is present."
                 ),
                 round_number=round_num,
                 consultation_depth=depth + 1,
             )
-            oss_response = self._transport.consult("oss-kafka", oss_request)
+            clients_response = self._transport.consult("kafka-clients", clients_request)
 
         # --- build the response for this round ---
         new_concerns: list[str] = []
         open_questions: list[str] = []
         follow_ups: list[str] = []
-        needs_org_authority = False
-        org_reason = ""
 
         if round_num == 1:
             # Round 1: raise the substantive concerns, including correcting
-            # kora-global's alternative B.
+            # mirrormaker's alternative B.
             new_concerns = [
                 "Your alternative B is not correct as specified: `__consumer_offsets` holds "
                 "*committed offsets*, not live subscriptions. A group that has joined and "
                 "been assigned partitions but has not committed yet is invisible in that "
-                "view, so you would silently skip clamping it. That is a correctness bug, "
-                "not a performance tradeoff.",
-                "Alternative C will not reach your 50ms target — batching describeGroups "
-                "reduces RPC count but the coordinator still reads every group's metadata, "
-                "so you land around 1-2s.",
+                "view, so you would silently skip checkpointing it. That is a correctness "
+                "bug, not a performance tradeoff.",
+                "Alternative C will not reach your target — batching describeConsumerGroups "
+                "reduces round trips but each coordinator still reads every group's "
+                "metadata, so you land around 1-2s.",
                 f"The index costs ~{mem_cost['total_mb']}MB per 50k-group cluster in broker "
-                f"heap. That is acceptable to us but broker-team must be looped in before "
-                f"it is enabled by default.",
-                "Coordinator failover needs a ~800ms index rebuild from "
+                f"heap. That is acceptable to us but kafka-broker must sign off before it "
+                f"is enabled by default.",
+                "Coordinator shard load needs a ~800ms index rebuild from "
                 "`__consumer_offsets` replay; we need the scan path retained as the "
                 "fallback during that window.",
             ]
             verdict = "needs_changes"
             summary = (
                 f"Alternative A is implementable and we will own it. Memory cost verified "
-                f"at {mem_cost['total_mb']}MB total / "
-                f"{mem_cost['per_coordinator_mb']}MB per coordinator partition for 50k "
-                f"groups — under 1% of coordinator heap. Changes are scoped to "
-                f"handleJoinGroup, handleLeaveGroup, handleListGroups and a new "
-                f"TopicPartitionGroupIndex. We reject your B on correctness grounds "
-                f"(committed offsets are not live subscriptions) and your C on the target "
-                f"(still O(n_groups), lands at 1-2s). We have three implementation options "
-                f"for the index itself and recommend the eager in-memory HashMap. "
-                f"We consulted oss-kafka on the protocol surface."
+                f"at {mem_cost['total_mb']}MB total / {mem_cost['per_shard_mb']}MB per "
+                f"coordinator shard for 50k groups — under 1% of broker heap. Changes are "
+                f"scoped to the subscription-mutation paths in GroupMetadataManager, the "
+                f"filtered ListGroups handler, and a new TopicPartitionGroupIndex. We "
+                f"reject your B on correctness grounds (committed offsets are not live "
+                f"subscriptions) and your C on the target (still O(n_groups), lands at "
+                f"1-2s). We have three implementation options for the index itself and "
+                f"recommend the eager in-memory HashMap. We consulted kafka-clients on the "
+                f"protocol surface."
             )
-            if oss_response and not oss_response.timed_out:
-                summary += f" oss-kafka says: {oss_response.summary}"
-                follow_ups.append("oss-kafka")
-                open_questions.extend(oss_response.open_questions)
+            if clients_response and not clients_response.timed_out:
+                summary += f" kafka-clients says: {clients_response.summary}"
+                follow_ups.append("kafka-clients")
+                open_questions.extend(clients_response.open_questions)
             else:
                 open_questions.append(
                     "Protocol surface for the public API filter is unconfirmed — "
-                    "oss-kafka was unreachable."
+                    "kafka-clients was unreachable."
                 )
-                follow_ups.append("oss-kafka")
+                follow_ups.append("kafka-clients")
 
         elif round_num == 2:
             # Round 2: concerns were folded in; converge on a recommendation.
             verdict = "needs_changes"
             new_concerns = [
-                "One remaining ask: the feature flag must be per-cluster, not global, so we "
-                "can enable on small clusters first and keep a blast-radius-limited rollout."
+                "One remaining ask: the feature flag must be per-broker config, not a "
+                "cluster-wide switch, so operators can enable it on small clusters first "
+                "and keep a blast-radius-limited rollout."
             ]
             summary = (
                 "Agreed on alternative A with the eager in-memory HashMap implementation. "
-                "Rebuild-on-failover at ~800ms is acceptable given the scan path stays as "
+                "Rebuild-on-load at ~800ms is acceptable given the scan path stays as "
                 "fallback behind the same flag. We will add index size and hit-rate metrics "
-                "to GroupCoordinatorMetrics so shadow mode is verifiable. Requesting a "
-                "per-cluster feature flag rather than a global one."
+                "to the coordinator metrics group so shadow mode is verifiable. Requesting "
+                "a per-broker config rather than a cluster-wide switch."
             )
 
         else:
             # Round 3: everything settled from our side.
             verdict = "agreed"
-            new_concerns = []
             summary = (
                 "Agreed and settled from our side. Alternative A, eager in-memory index in "
-                "TopicPartitionGroupIndex, per-cluster feature flag, scan retained as "
-                "fallback, shadow mode with a mismatch metric before we trust the index. "
-                "Our test requirements are captured below. No further concerns."
+                "TopicPartitionGroupIndex, per-broker config, scan retained as fallback, "
+                "shadow mode with a mismatch metric before we trust the index. Our test "
+                "requirements are captured below. No further concerns."
             )
 
         return ImpactResponse(
@@ -404,19 +411,21 @@ class ConsumerTeamAgent(SMEAgentBase):
             confidence=0.92,
             summary=summary,
             principal_review=(
-                "The structural problem is that GroupCoordinator indexes group → "
-                "subscriptions but the failover path asks the inverse question. Adding the "
-                "reverse index is the correct fix and it belongs on our side of the "
-                "boundary, not in Cluster Linking. I want to be explicit about why I am "
-                "pushing back on your alternative B: it is not merely a duplicate-state "
-                "tradeoff, it is incorrect. `__consumer_offsets` is a record of commits, "
-                "and subscription state is not commit state. Building a clamping decision "
-                "on it means a group that joined moments before failover and has not "
-                "committed yet gets silently skipped, and a skipped clamp is a consumer "
-                "resuming at an invalid offset. That is a data-correctness failure in a "
-                "disaster-recovery path, which is the worst possible place for one. "
-                "Alternative A costs us more calendar time and a KIP dependency, and it is "
-                "still the right call."
+                "The structural problem is that the coordinator indexes group → "
+                "subscriptions but the replication path asks the inverse question. Adding "
+                "the reverse index is the correct fix and it belongs on our side of the "
+                "boundary, not in MirrorMaker. I want to be explicit about why I am pushing "
+                "back on your alternative B: it is not merely a duplicate-state tradeoff, "
+                "it is incorrect. `__consumer_offsets` is a record of commits, and "
+                "subscription state is not commit state. Building a checkpoint decision on "
+                "it means a group that joined moments before failover and has not committed "
+                "yet gets silently skipped, and a skipped checkpoint is a consumer resuming "
+                "at an invalid offset on the target cluster. That is a data-correctness "
+                "failure in a disaster-recovery path, which is the worst possible place for "
+                "one. Alternative A costs more calendar time and a KIP dependency, and it "
+                "is still the right call. Worth noting the index is protocol-agnostic: both "
+                "classic and KIP-848 consumer groups mutate subscriptions through this "
+                "manager, so one index serves both."
             ),
             design_alternatives=alternatives,
             recommendation=(
@@ -426,22 +435,24 @@ class ConsumerTeamAgent(SMEAgentBase):
                 "and it keeps consumer-group state inside the team that owns it."
             ),
             cited_codepaths=[
-                "GroupCoordinator.scala",
-                "GroupMetadata.scala",
+                "GroupMetadataManager.java",
+                "GroupCoordinatorShard.java",
                 "TopicPartitionGroupIndex.java",
-                "GroupCoordinatorConfig.scala",
+                "GroupCoordinatorConfig.java",
             ],
             new_concerns=new_concerns,
             open_questions=open_questions,
             follow_up_consultations=follow_ups,
             test_requirements=[
-                "Unit: index contents match a brute-force scan of groupMetadataCache after "
-                "10k randomized join/leave/timeout sequences.",
-                "Unit: handleListGroups with an empty topic_partitions filter returns "
-                "byte-identical results to v4 (backward compatibility).",
-                "Unit: index mutation on heartbeat-timeout removal, not just explicit "
+                "Unit: index contents match a brute-force scan of group metadata after 10k "
+                "randomized join/leave/timeout sequences.",
+                "Unit: filtered ListGroups with an empty topic_partitions filter returns "
+                "byte-identical results to v5 (backward compatibility).",
+                "Unit: index mutation on session-timeout eviction, not just explicit "
                 "LeaveGroup.",
-                "Integration: coordinator failover rebuilds the index from "
+                "Unit: index is maintained identically for classic groups and KIP-848 "
+                "consumer groups.",
+                "Integration: coordinator shard load rebuilds the index from "
                 "`__consumer_offsets` replay and converges to the same contents within "
                 "1 second for 50k groups.",
                 "Integration: requests served from the scan fallback while a rebuild is in "
@@ -451,6 +462,4 @@ class ConsumerTeamAgent(SMEAgentBase):
                 "Metrics: index size and hit rate are exported so shadow mode can be "
                 "validated before the flag is enabled.",
             ],
-            needs_org_authority=needs_org_authority,
-            org_authority_reason=org_reason,
         )

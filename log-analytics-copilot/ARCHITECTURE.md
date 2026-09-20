@@ -28,12 +28,15 @@ them:
 - **Part IX** is a phased implementation plan with concrete unit and
   integration tests gating every step.
 
-One example is used consistently throughout: **the Kora Global team
-(Cluster Linking) has already identified that its offset-clamping code is
-too slow and has a rough idea of the fix. It owns the ticket and drives
-the work, consulting the Consumer Team (GroupCoordinator) and the OSS
-Kafka team (protocol/KIPs) directly along the way.** Concrete runbooks for
-these three agents live in [`runbooks/`](./runbooks/).
+One example is used consistently throughout: **the MirrorMaker team
+(cross-cluster async replication) has already identified that its consumer
+group discovery path is too slow and has a rough idea of the fix. It owns the
+ticket and drives the work, consulting the group coordinator team, the broker
+team, and the clients team directly along the way.** Concrete runbooks for
+these four agents live in [`runbooks/`](./runbooks/).
+
+Everything in this document targets **Apache Kafka 4.3** and real upstream
+module paths. There is no vendor-specific surface anywhere in the system.
 
 ---
 
@@ -44,7 +47,7 @@ these three agents live in [`runbooks/`](./runbooks/).
 In a real engineering organization, most tickets do not start as a mystery
 that needs to be triaged from scratch. **A specific team notices a
 specific problem in a system it owns, and usually already has a rough
-idea of the fix.** For example: the Cluster Linking team notices that
+idea of the fix.** For example: the MirrorMaker team notices that
 their failover path is slow, traces it to a specific function, and has a
 hypothesis — "we probably need an indexed lookup instead of a full scan."
 That team files the ticket, and that team is the one who has to drive it
@@ -54,7 +57,7 @@ The hard part isn't figuring out *whose* problem this is — they already
 know. The hard part is everything downstream of that:
 
 - The proposed fix touches **code owned by another team**
-  (`GroupCoordinator` belongs to the Consumer Team, not Cluster Linking),
+  (`GroupMetadataManager` belongs to the group coordinator team, not MirrorMaker),
   and someone has to actually validate whether the idea works there
 - That validation might surface a **further dependency** neither team
   anticipated (a protocol change requiring upstream approval through the
@@ -189,8 +192,8 @@ Kafka trivia.
 ```
                     ┌─────────────────────┐
                     │   Team SME Agent     │
-                    │  e.g. "Kora Global   │
-                    │  (Cluster Linking)"  │
+                    │  e.g. "MirrorMaker   │
+                    │  (MirrorMaker 2)"  │
                     └──────────┬──────────┘
                                │
              ┌─────────────────┼─────────────────┐
@@ -213,12 +216,12 @@ Kafka trivia.
 ```
 
 **Domain Memory** is what makes the agent an SME rather than a generic
-assistant, and it is the slowest-changing layer. For the Kora Global
+assistant, and it is the slowest-changing layer. For the MirrorMaker
 agent, this is everything in
-[`runbooks/kora-global-sme.md`](./runbooks/kora-global-sme.md): which
+[`runbooks/mirrormaker-sme.md`](./runbooks/mirrormaker-sme.md): which
 repositories it owns, exactly which files and line ranges within them,
 known performance invariants, and the history of past incidents in
-Cluster Linking. This is deliberately **not** a single vector database
+MirrorMaker 2. This is deliberately **not** a single vector database
 with everything dumped in and retrieved by similarity search — see §7 for
 why ownership and dependency are graph questions, not similarity
 questions.
@@ -266,27 +269,43 @@ detail that makes this a network of specialists rather than five copies
 of the same generalist with different system prompts. It's enforced in
 code, not just requested in a prompt.
 
-Here are the three agents that exist today (full detail, including exact
-file paths and line numbers, is in each agent's runbook):
+Here are the four agents that exist today. Each maps to a real Apache Kafka
+subsystem with a real module path; full detail is in each agent's runbook.
 
 ```
-kora-global          (Cluster Linking — owns the example ticket below)
+mirrormaker          (MirrorMaker 2 — owns the example ticket below)
   owns:
-    confluent/kora-cluster-linking/src/main/java/io/confluent/clusterlink/
-    → see runbooks/kora-global-sme.md
+    connect/mirror/src/main/java/org/apache/kafka/connect/mirror/
+      MirrorCheckpointConnector, MirrorCheckpointTask, OffsetSyncStore
+    → see runbooks/mirrormaker-sme.md
 
-consumer-team        (GroupCoordinator — consulted for feasibility)
+group-coordinator    (consumer groups — consulted for feasibility)
   owns:
-    apache/kafka: core/src/main/scala/kafka/coordinator/group/
-    confluent/kora-group-coordinator/
-    → see runbooks/consumer-team-sme.md
+    group-coordinator/src/main/java/org/apache/kafka/coordinator/group/
+      GroupMetadataManager, GroupCoordinatorShard, OffsetMetadataManager
+    → see runbooks/group-coordinator-sme.md
 
-oss-kafka            (Protocol + KIP process — consulted for the upstream path)
+kafka-broker         (request routing + KRaft — consulted for servability)
   owns:
-    apache/kafka: clients/src/main/resources/common/message/*.json
+    core/src/main/scala/kafka/server/          KafkaApis, BrokerServer
+    metadata/src/main/java/org/apache/kafka/   QuorumController, MetadataImage
+    → see runbooks/kafka-broker-sme.md
+
+kafka-clients        (wire protocol + KIP process — consulted for the API surface)
+  owns:
+    clients/src/main/resources/common/message/*.json
+    clients/src/main/java/org/apache/kafka/clients/admin/
     the Apache Kafka KIP process itself
-    → see runbooks/oss-kafka-sme.md
+    → see runbooks/kafka-clients-sme.md
 ```
+
+**Why the broker is a separate agent rather than folded into the coordinator.**
+It is the only team that owns the fact that a group's coordinator shard is
+`abs(group_id.hashCode()) % 50` — which has nothing to do with the topics that
+group consumes. That single fact means a topic-scoped `ListGroups` must still
+fan out to every shard, which none of the other three agents can know. Splitting
+it out is what lets that correction surface during deliberation instead of
+during implementation.
 
 **The rule that makes this matter:** when an agent's own investigation
 touches a codepath it does not own, it is not allowed to guess about it,
@@ -421,29 +440,29 @@ my paraphrase of someone else's paraphrase," with no visible signal of
 where confidence should have dropped.
 
 So agents exchange a **typed, structured message** instead. Here is the
-actual example from the running scenario: `kora-global` already diagnosed
+actual example from the running scenario: `mirrormaker` already diagnosed
 that its offset-clamping code is slow because of full group scans, and
-has a rough fix idea. It now needs to ask `consumer-team` — who actually
-owns `GroupCoordinator` — whether that idea is even feasible.
+has a rough fix idea. It now needs to ask `group-coordinator` — who actually
+owns `GroupMetadataManager` — whether that idea is even feasible.
 
-**Request, from `kora-global` directly to `consumer-team`:**
+**Request, from `mirrormaker` directly to `group-coordinator`:**
 
 ```json
 {
-  "from": "kora-global",
-  "to": "consumer-team",
+  "from": "mirrormaker",
+  "to": "group-coordinator",
   "request_type": "impact_analysis",
   "change_description": "We've traced our offset-clamping slowness to a full ListGroups() scan on every failover. We want an indexed lookup: given a topic-partition, return only the subscribed groups, instead of scanning the whole cluster.",
   "questions": [
     "Can GroupCoordinator support an indexed reverse lookup by topic-partition?",
-    "What would the memory cost be at Confluent Cloud scale?",
+    "What would the memory cost be at scale?",
     "Does this require a new Kafka protocol version?"
   ],
   "ticket_id": "CL-4821"
 }
 ```
 
-**Response, from `consumer-team` directly back to `kora-global`:**
+**Response, from `group-coordinator` directly back to `mirrormaker`:**
 
 ```json
 {
@@ -453,18 +472,18 @@ owns `GroupCoordinator` — whether that idea is even feasible.
   "codepaths": ["GroupCoordinator#handleListGroups"],
   "tests": ["GroupCoordinatorTest#testListGroupsFiltering"],
   "confidence": 0.9,
-  "open_questions": ["needs a new Kafka API version — ask oss-kafka"]
+  "open_questions": ["needs a new Kafka API version — ask kafka-clients"]
 }
 ```
 
-The response is not a courtesy reply — `consumer-team` actually ran its
+The response is not a courtesy reply — `group-coordinator` actually ran its
 own tools (`get_offset_storage_schema`, `estimate_index_memory_cost`) to
-produce it, exactly as the human Consumer Team engineer would have if
-Slacked with the same question. Notice the last field: `consumer-team`
+produce it, exactly as the human Group Coordinator team engineer would have if
+Slacked with the same question. Notice the last field: `group-coordinator`
 itself does not know whether this needs a new protocol version, so it
 says so explicitly and — on its own initiative, without being told to —
-goes and asks `oss-kafka` next. **No third party decided that consumer-team
-should talk to oss-kafka; consumer-team figured that out itself, the same
+goes and asks `kafka-clients` next. **No third party decided that group-coordinator
+should talk to kafka-clients; group-coordinator figured that out itself, the same
 way a human engineer would realize mid-investigation that they need to
 loop in one more person.**
 
@@ -515,11 +534,11 @@ people get pulled in to help.
                   ┌───────────────────┐
                   │  Ticket Router     │   ← the ONLY central component,
                   │  (intake only —    │     and it does no reasoning —
-                  │   no reasoning)    │     it just reads "team: kora-
-                  └─────────┬─────────┘     global" off the ticket and
-                            │                hands it to that agent
+                  │   no reasoning)    │     it just reads
+                  └─────────┬─────────┘     "team: mirrormaker" off the
+                            │                ticket and hands it to that agent
                             ▼
-                  kora-global agent
+                  mirrormaker agent
                   (owns this ticket end to end)
                             │
               investigates with its OWN tools,
@@ -530,23 +549,23 @@ people get pulled in to help.
                             │
                             ▼
               sends a typed ImpactRequest directly to
-              consumer-team (§8)
+              group-coordinator (§8)
                             │
-              consumer-team does its OWN real diligence,
-              realizes it needs oss-kafka, and consults
-              oss-kafka directly — on its own initiative
+              group-coordinator does its OWN real diligence,
+              realizes it needs kafka-clients, and consults
+              kafka-clients directly — on its own initiative
                             │
-              responses flow back to kora-global
+              responses flow back to mirrormaker
                             │
                             ▼
-              kora-global — because it OWNS the ticket —
+              mirrormaker — because it OWNS the ticket —
               assembles the final plan itself: root cause,
               approvals needed, execution order, and what's
               still genuinely uncertain
                             │
                             ▼
                     Human approval gate
-              (only if kora-global itself determines a
+              (only if mirrormaker itself determines a
                decision genuinely requires one)
 ```
 
@@ -588,7 +607,7 @@ a ticket.
                                │ to the one agent that owns it
                                ▼
 ┌─────────────────────────────────────────────────────────────────────┐
-│           THE OWNING SME AGENT (e.g. kora-global)                    │
+│           THE OWNING SME AGENT (e.g. mirrormaker)                    │
 │  • Investigates with its own tools and its own Domain Memory (§5)    │
 │  • Looks up ownership in the Knowledge Graph (§7) to decide who       │
 │    else it needs — on its own, the way a human engineer would        │
@@ -600,7 +619,7 @@ a ticket.
 ┌──────────┐                                        ┌──────────┐
 │   SME    │  ── may itself consult a third agent → │   SME    │
 │  Agent:  │     the same way, on its own            │  Agent:  │
-│ Consumer │     initiative (e.g. consumer-team      │   OSS    │
+│ Consumer │     initiative (e.g. group-coordinator      │   OSS    │
 │  Team    │◄──────────────────────────────────────► │  Kafka   │
 └────┬─────┘                                        └────┬─────┘
      │                                                    │
@@ -639,130 +658,166 @@ agent reads from.
 
 # Part V — Seeing It Work
 
-## 11. End-to-End Walkthrough: Consumer Groups Per Topic
+## 11. End-to-End Walkthrough: Finding Consumer Groups By Topic
 
-**The starting point is not a mystery bug.** The Kora Global team already
-noticed, in its own production data, that failover is too slow, and it
-already has a hypothesis about the fix. That's the normal case, and it's
+**The starting point is not a mystery bug.** The MirrorMaker team already
+noticed, in its own production data, that checkpoint emission is too slow, and
+it already has a hypothesis about the fix. That's the normal case, and it's
 where this walkthrough starts.
 
-**What Kora Global already knows before filing the ticket:** during a
-failover, `ClusterLinking.clampOffsets()` has to find every consumer group
-subscribed to the topics being failed over. Today it does this by listing
-*every* group in the entire cluster and checking each one — on a cluster
-with 50,000 groups, that takes 8–12 seconds and hammers the exact
-component (`GroupCoordinator`) that's already under stress during a
-failover. Kora Global's rough idea: a lookup that goes directly from
-"this topic-partition" to "these specific groups," without scanning
-everything else.
+**What MirrorMaker already knows before filing the ticket:** to let consumers
+fail over to the target cluster, `MirrorCheckpointConnector.findConsumerGroups()`
+has to find every consumer group consuming the replicated topics, so their
+offsets can be translated and checkpointed. Today it does that by listing
+*every* group in the cluster and describing each one. On a cluster with 50,000
+groups that takes 8–12 seconds, it runs on every checkpoint interval, and it
+hammers the group coordinators at exactly the moment a failover has them under
+stress. MirrorMaker's rough idea: ask Kafka directly which groups consume a
+topic, instead of asking for all of them and filtering.
 
 ```
-clampOffsets(topic, partition):                 # what happens today
-  all_groups = ListGroups()                     # O(n_groups) — 8s for 50k groups
+findConsumerGroups(replicated_topics):           # what happens today
+  all_groups = listConsumerGroups()              # O(n_groups) — 840ms for 50k
   for group in all_groups:
-    if topic in DescribeGroup(group):            # extra RPC per group
-      clamp(group, topic, partition)
+    if topic in describeConsumerGroups(group):   # 8.1s of fan-out
+      checkpoint(group, topic)                   # only 4 groups reach here
 
-clampOffsets(topic, partition):                 # Kora Global's proposed fix
-  groups = ListGroupsForTopicPartition(topic, partition)  # O(1) — <50ms
+findConsumerGroups(replicated_topics):           # MirrorMaker's proposed fix
+  groups = listConsumerGroups(inTopicPartitions=tps)   # one filtered call
   for group in groups:
-    clamp(group, topic, partition)
+    checkpoint(group, topic)
 ```
 
-Here is `kora-global` owning this ticket from start to finish:
+Here is `mirrormaker` owning this ticket from start to finish. Every tool call
+below is a real method on a real agent, and every message is a typed §8 record.
 
 ```
-13:42:01  Ticket filed BY Kora Global, assigned to Kora Global:
-          "Our clampOffsets() is too slow because of a full ListGroups()
-           scan on every failover. We think we need an indexed lookup by
-           topic-partition. Need to confirm this is feasible and figure
-           out what it takes to ship."
+13:42:01  Ticket filed BY MirrorMaker, assigned to MirrorMaker:
+          "findConsumerGroups() is too slow because of a full
+           listConsumerGroups + describeConsumerGroups fan-out on every
+           checkpoint interval. We think we need a topic-scoped lookup.
+           Need to confirm feasibility and what it takes to ship."
 
-13:42:03  Ticket Router reads "team: kora-global" off the ticket and
-          hands it straight to the kora-global agent — no classification,
+13:42:03  Ticket Router reads "team: mirrormaker" off the ticket and
+          hands it straight to the mirrormaker agent — no classification,
           no other agent is even aware of this yet
 
-13:42:12  kora-global agent starts working ITS OWN ticket, using ITS OWN
-          tools to firm up the diagnosis it already suspected:
-          tool get_failover_latency()   → p99 = 11,400ms, 91% of that
-                                           time spent inside listGroups
-          tool get_offset_clamp_trace() → confirms 50,312 groups scanned
-                                           to find just 4 real matches
-          → its own hypothesis is now backed by hard evidence, but it
-            knows it doesn't own GroupCoordinator, so it can't just
-            assume the fix is buildable — it has to ask
+13:42:12  mirrormaker works ITS OWN ticket with ITS OWN tools, firming up
+          the diagnosis it already suspected:
+          get_checkpoint_latency()     → p99 = 11,400ms, 91% of it inside
+                                          listConsumerGroups + describe
+          get_group_discovery_trace()  → 50,312 groups scanned to find 4
+                                          real matches (0.008% hit rate)
+          list_replication_flows()     → 2 active flows affected
+          → hypothesis now backed by evidence. But it does not own the
+            coordinator, the broker, or the protocol, so it cannot assume
+            the fix is buildable. It has to ask.
 
-13:42:21  kora-global looks up ownership in the Knowledge Graph (§7):
-          "GroupCoordinator" → owned_by → consumer-team
-          → sends consumer-team a typed ImpactRequest directly:
-          "We've traced this to a full ListGroups() scan. Can
-           GroupCoordinator support an indexed lookup by topic-partition?
-           What would it cost in memory?"
+13:42:18  mirrormaker proposes THREE alternatives before consulting anyone,
+          so peers review a real solution space rather than one idea:
+            A  broker-side reverse index + ListGroups v6 topic filter
+            B  MM2-local view built by tailing __consumer_offsets
+            C  batch + parallelize the existing scan
+          It flags its own concern about B: committed offsets may not be
+          the same thing as live subscriptions.
 
-13:42:27  consumer-team receives the request and does ITS OWN real
-          diligence — not a courtesy answer, actual investigation:
-          tool get_offset_storage_schema()  → confirms no reverse index
-                                                exists today
-          tool estimate_index_memory_cost() → ~14MB overhead for a
-                                                50,000-group cluster
-          ImpactResponse:
-            affected_components: [GroupCoordinator, GroupMetadata]
-            invariants: ["group state must stay consistent across rebalance"]
-            confidence: 0.9
-            open_questions: ["needs a new Kafka API version — ask oss-kafka"]
+13:42:21  Knowledge Graph lookup (§7): "GroupMetadataManager" → owned_by →
+          group-coordinator. Sends a typed ImpactRequest directly.
 
-13:42:31  consumer-team, on its OWN initiative — nobody told it to —
-          recognizes it needs a second opinion and consults oss-kafka
-          directly: "Does adding a topic-partition filter to ListGroups
-          need a KIP?"
+13:42:27  group-coordinator does ITS OWN diligence — not a courtesy reply:
+          get_offset_storage_schema()   → no reverse index exists today
+          estimate_index_memory_cost(50_000, 8)
+                                       → 13.7MB total, 0.27MB per shard
+          get_rebalance_history()       → 14 rebalances/hour, so write-path
+                                           churn is not hot-path frequency
+          verdict: needs_changes
+          new_concerns: ["your alternative B is INCORRECT, not just
+                          slower — __consumer_offsets holds committed
+                          offsets, not live subscriptions, so a group that
+                          joined and has not committed is invisible"]
+          → it confirms MirrorMaker's suspicion and escalates it from a
+            tradeoff to a correctness objection
 
-13:42:44  oss-kafka does its OWN real diligence — it owns the protocol
-          and the KIP process, so it checks against real precedent:
-          tool search_kips("ListGroups topic partition filter")
-               → finds KIP-518 as the closest precedent, confirms it does
-                 NOT cover this case — a new KIP is genuinely required
-          tool check_compat(api_key=16, proposed_version=5, ...)
-               → passes, with one note: interaction with the newer
-                 KIP-848 consumer protocol needs explicit review
-          ImpactResponse: impact_level = HIGH, confidence = 0.92
-          → responds back to consumer-team, who relays the combined
-            answer back to kora-global
+13:42:31  group-coordinator, on its OWN initiative — nobody told it to —
+          consults kafka-clients about the API surface it does not own.
 
-13:43:20  kora-global — because it OWNS this ticket — assembles the final
-          plan itself, from what it learned across both consultations:
+13:42:44  kafka-clients checks real precedent:
+          search_kips("ListGroups topic partition filter")
+               → KIP-518 added states_filter (v4), KIP-848 added
+                 types_filter (v5). Two accepted filter fields on this
+                 exact API: strong prior art, but neither covers topics,
+                 so a new KIP is genuinely required.
+          get_api_spec("LISTGROUPS")    → max version 5, flexible since v3,
+                                           so a tagged field is wire-safe
+          check_compat(16, 6, ["topic_partitions"])
+               → PASS_WITH_NOTE: behaviour for KIP-848 consumer groups vs
+                 classic groups must be specified before a vote
+          → recommends ListGroupsRequest v6 with an optional tagged field,
+            AND states the unblocking path: the server-side index is not a
+            wire change, so it can land without waiting on the KIP
+
+13:42:52  mirrormaker consults kafka-broker, because someone has to serve
+          this request. This is where the design gets corrected:
+          get_request_routing("LISTGROUPS")
+               → fan_out_all_coordinator_shards, 50 shards
+          get_coordinator_distribution("orders")
+               → only 4 shards hold a matching group, but all 50 must be
+                 queried, because placement is abs(group_id.hashCode()) % 50
+                 and has nothing to do with subscribed topics
+          get_broker_heap_profile(12)   → 14MB is 0.23% of total heap, fine
+          get_kraft_metadata_budget()   → group churn is ~32x the metadata
+                                           log's steady-state record rate
+          new_concerns: ["a filtered ListGroups CANNOT be a single targeted
+                          lookup — the fan-out is structural. The index
+                          makes each shard O(1) instead of O(groups_on_shard),
+                          which is still the right fix, but the design doc
+                          must say so", "partial results when a shard is
+                          unavailable is a PROTOCOL concern, not an
+                          implementation detail"]
+          → rejects putting the index in KRaft metadata (churn ratio) and
+            rejects re-hashing group placement (breaks every client)
+
+13:43:20  Rounds 2 and 3: concerns get folded in and each peer converges.
+          group-coordinator asks for a per-broker config rather than a
+          cluster-wide switch. kafka-broker asks that partial-result
+          semantics go in the KIP. Both reach verdict: agreed.
+
+13:43:48  mirrormaker — because it OWNS this ticket — assembles the 1-pager
+          itself from what it learned across three consultations:
           execution_order:
-            1. kora-global confirms this should go upstream, not stay
-               Confluent-internal
-            2. consumer-team drafts the KIP
-            3. oss-kafka runs the community vote (~4 weeks)
-            4. consumer-team implements the approved change
-            5. kora-global integrates the new API into clampOffsets()
-          approvals_needed: [consumer-team lead, oss-kafka committer]
+            1. group-coordinator adds the index behind a feature flag
+            2. kafka-broker confirms scatter-gather routing + heap budget
+            3. kafka-clients posts the ListGroups v6 KIP, citing KIP-518
+            4. MM2 switches to the filtered call, scan kept as fallback
+            5. validate p99 across one failover drill per region
           requires_human: true
-          escalation_reason: "Two team lead approvals are required before
-                               implementation can begin — this is a real
-                               decision, not something to resolve silently"
-
-13:43:22  kora-global updates its OWN ticket with: the root cause
-          (now backed by hard evidence, not just a hunch), the affected
-          components across two other teams, the full approval chain,
-          and the one open question (KIP-848 compatibility) nobody could
-          fully resolve.
+          human_decision_points: ["kafka-clients: the ListGroups v6 KIP
+                                    needs a sponsoring Apache PMC committer
+                                    and 3 binding +1 votes"]
 ```
 
-Every line above corresponds to a real tool declared in that agent's
-runbook and a real typed message from §8 — nothing here is scripted for a
-pitch. In an actual demo, you should be able to click into any line and
-see the exact `ImpactRequest`/`ImpactResponse` JSON and the raw tool
-output behind it. **That auditability is the actual product**, not a side
-effect of it.
+Note what did **not** escalate. Memory cost, index rebuild time, feature-flag
+scope, request routing, and partial-result semantics were all settled
+agent-to-agent. The single escalation is the Apache PMC vote — the one thing
+that genuinely requires organizational standing rather than engineering
+judgment. An agent network that escalates because a question is hard is not
+useful; this one escalates only because a vote cannot be delegated.
 
-The full domain runbooks referenced above — with exact repository paths,
-line ranges, and complete tool specifications — are:
+Every line above corresponds to a real tool declared in that agent's runbook
+and a real typed message from §8 — nothing here is scripted for a pitch. You
+can click into any line and see the exact `ImpactRequest`/`ImpactResponse` and
+the raw tool output behind it. **That auditability is the actual product**, not
+a side effect of it. The rendered artifact from this exact run is checked in at
+[`examples/group-discovery-by-topic.design-doc.md`](./examples/group-discovery-by-topic.design-doc.md),
+and [`tests/integration/test_group_discovery_by_topic_e2e.py`](./tests/integration/test_group_discovery_by_topic_e2e.py)
+replays it as a regression guard.
 
-- [`runbooks/kora-global-sme.md`](./runbooks/kora-global-sme.md)
-- [`runbooks/consumer-team-sme.md`](./runbooks/consumer-team-sme.md)
-- [`runbooks/oss-kafka-sme.md`](./runbooks/oss-kafka-sme.md)
+The full domain runbooks referenced above are:
+
+- [`runbooks/mirrormaker-sme.md`](./runbooks/mirrormaker-sme.md)
+- [`runbooks/group-coordinator-sme.md`](./runbooks/group-coordinator-sme.md)
+- [`runbooks/kafka-broker-sme.md`](./runbooks/kafka-broker-sme.md)
+- [`runbooks/kafka-clients-sme.md`](./runbooks/kafka-clients-sme.md)
 
 ---
 
@@ -775,29 +830,32 @@ question is: what does this system have in six months that a competitor
 starting from scratch does not?
 
 Look back at the walkthrough in Part V. Notice the chain that
-`kora-global` had to discover by actually consulting people, because
+`mirrormaker` had to discover by actually consulting people, because
 nothing told it up front:
 
 ```
 Failover
    ↓
-Offset clamping   (owned by kora-global — where the ticket started)
+Checkpoint group discovery  (owned by mirrormaker — where the ticket started)
    ↓
-ListGroups scan   (owned by consumer-team — first agent consulted)
+listConsumerGroups scan     (owned by group-coordinator — first consulted)
    ↓
-GroupCoordinator index design
+Reverse index design        (group-coordinator)
    ↓
-Kafka protocol version bump
+Coordinator-shard fan-out   (owned by kafka-broker — a constraint nobody
+                             else could have known about)
    ↓
-KIP approval   (owned by oss-kafka — consulted by consumer-team, not
-                 by kora-global directly — a chain kora-global didn't
+ListGroups v6 version bump
+   ↓
+KIP approval   (owned by kafka-clients — consulted by group-coordinator, not
+                 by mirrormaker directly — a chain mirrormaker didn't
                  even know to expect)
 ```
 
 The first time this ticket type comes through, discovering that chain
 requires the full sequence of consultations from Part V. **But that
-chain — "changes to offset clamping eventually need protocol-level
-approval through consumer-team and oss-kafka" — gets written back into the
+chain — "changes to MM2 checkpoint discovery eventually need protocol-level
+approval through group-coordinator and kafka-clients" — gets written back into the
 Knowledge Graph as real `depends_on` and `must_approve` edges once this
 ticket resolves.**
 
@@ -896,17 +954,19 @@ log-analytics-copilot/
 │   ├── base_agent.py             # SMEAgentBase: the 3-layer context (§5),
 │   │                              # OwnTicket() workflow AND ConsultAbout()
 │   │                              # workflow, ownership self-validation (§6)
-│   ├── kora_global_agent.py
-│   ├── consumer_team_agent.py
-│   ├── oss_kafka_agent.py
-│   ├── broker_team_agent.py      # future
-│   ├── billing_team_agent.py     # future
+│   ├── mirrormaker_agent.py
+│   ├── group_coordinator_agent.py
+│   ├── kafka_broker_agent.py
+│   ├── kafka_clients_agent.py
+│   ├── kafka_streams_agent.py    # future
+│   ├── kafka_connect_agent.py    # future
 │   └── Dockerfile
 │
 ├── runbooks/                     # persistent Domain Memory per agent (§5)
-│   ├── kora-global-sme.md
-│   ├── consumer-team-sme.md
-│   └── oss-kafka-sme.md
+│   ├── mirrormaker-sme.md
+│   ├── group-coordinator-sme.md
+│   ├── kafka-broker-sme.md
+│   └── kafka-clients-sme.md
 │
 ├── mcp-server/
 │   ├── main.py                   # FastAPI MCP tool server (existing)
@@ -1014,7 +1074,8 @@ directly from the new agent's declared `OWNS` list.
 - [x] MCP server with 5 tools (`query_logs`, `top_errors`, `search_keyword`,
       `pipeline_status`, `optimize_table`)
 - [x] `proto/logs.proto` + `LogIngestionService`
-- [x] Three SME runbooks (`kora-global`, `consumer-team`, `oss-kafka`)
+- [x] Four SME runbooks (`mirrormaker`, `group-coordinator`, `kafka-broker`,
+      `kafka-clients`)
 
 ### Phase 1 — Knowledge Graph + typed protocol (Weeks 1–2)
 - [ ] `knowledge-graph/schema.sql` — entities + edges (§7)
@@ -1022,10 +1083,11 @@ directly from the new agent's declared `OWNS` list.
 - [ ] `knowledge-graph/query.py` — the lookup library every agent calls directly
 - [ ] `proto/sme_agents.proto` — `Ticket`, `Finding`, `ImpactRequest`/`ImpactResponse` (§8)
 
-### Phase 2 — Base agent framework + first three agents (Weeks 3–4)
+### Phase 2 — Base agent framework + first four agents (Weeks 3–4)
 - [ ] `agents/base_agent.py` — `OwnTicket()` and `ConsultAbout()` workflows,
       ownership self-validation (§6)
-- [ ] `agents/consumer_team_agent.py`, `kora_global_agent.py`, `oss_kafka_agent.py`
+- [ ] `agents/mirrormaker_agent.py`, `group_coordinator_agent.py`,
+      `kafka_broker_agent.py`, `kafka_clients_agent.py`
 - [ ] `router/main.py` — thin intake, team → agent address mapping
 
 ### Phase 3 — Prove the core hypothesis (Week 5)
@@ -1073,8 +1135,8 @@ its own?**
 Because that's what happens when a human specialist gets pulled into an
 investigation and realizes mid-way that they need someone else's input
 too — they don't report back "I don't know" and wait for someone else to
-decide who to ask next; they go ask. Consumer Team consulting OSS Kafka in
-Part V, without Kora Global ever asking for that specifically, is the
+decide who to ask next; they go ask. Group Coordinator team consulting OSS Kafka in
+Part V, without MirrorMaker ever asking for that specifically, is the
 system working as intended, not an edge case.
 
 **Why a typed agent-to-agent protocol instead of free-form chat?**
@@ -1238,22 +1300,22 @@ because every agent needs to run this lookup for itself.
 **Integration tests** (seed a real Postgres test DB from the three real
 runbooks):
 - `test_owning_team_of_list_groups_returns_consumer_team` —
-  `owning_team("ListGroups")` must return `"consumer-team"`
-- `test_owning_team_of_clamp_offsets_returns_kora_global` —
-  `owning_team("clampOffsets")` must return `"kora-global"`
+  `owning_team("ListGroups")` must return `"group-coordinator"`
+- `test_owning_team_of_checkpoint_connector_returns_mirrormaker` —
+  `owning_team("MirrorCheckpointConnector.java")` must return `"mirrormaker"`
 
 **Manual validation:**
 ```bash
 python -c "
 from knowledge_graph.query import owning_team
-print(owning_team('ListGroups'))    # expect: consumer-team
-print(owning_team('clampOffsets'))  # expect: kora-global
+print(owning_team('ListGroups'))    # expect: group-coordinator
+print(owning_team('findConsumerGroups'))  # expect: mirrormaker
 "
 ```
 
 **Definition of done for Phase 1:** all tests across 20.1–20.4 pass, and
 the two manual query calls above return the correct agent names — this is
-the exact lookup `kora-global` performs at `13:42:21` in the Part V
+the exact lookup `mirrormaker` performs at `13:42:21` in the Part V
 walkthrough, now backed by real code.
 
 ## 21. Phase 2 — Typed Protocol
@@ -1276,7 +1338,7 @@ Python stubs
 ```bash
 python -c "
 from proto import sme_agents_pb2 as pb
-m = pb.ImpactRequest(from_agent='kora-global', to_agent='consumer-team',
+m = pb.ImpactRequest(from_agent='mirrormaker', to_agent='group-coordinator',
                       request_type='impact_analysis')
 print(m)
 "
@@ -1299,9 +1361,9 @@ sending it out
 
 **Integration tests:**
 - `test_validator_against_consumer_team_runbook_fixture` — load the real
-  `OWNS` list from `consumer-team`'s manifest, confirm a citation of
+  `OWNS` list from `group-coordinator`'s manifest, confirm a citation of
   `GroupCoordinator.scala` passes while a citation of
-  `OffsetClampingService.java` (which belongs to `kora-global`) is
+  `OffsetClampingService.java` (which belongs to `mirrormaker`) is
   correctly flagged
 
 **Definition of done for Phase 2:** the proto compiles and round-trips
@@ -1331,13 +1393,13 @@ ownership using the real runbooks as ground truth.
 
 **Integration tests:**
 - `test_own_ticket_end_to_end_against_two_mocked_peer_agents` — mock
-  `consumer-team` and `oss-kafka` to return the exact canned responses from
-  Part V, run `kora_global_agent.OwnTicket()` for real, and assert the
+  `group-coordinator` and `kafka-clients` to return the exact canned responses from
+  Part V, run `mirrormaker_agent.OwnTicket()` for real, and assert the
   resulting plan matches §11's `execution_order` and `approvals_needed`
 
 **Manual validation:**
 ```bash
-python -m agents.kora_global_agent --own-ticket fixtures/consumer_groups_ticket.json
+python -m agents.mirrormaker_agent --own-ticket fixtures/group_discovery_ticket.json
 # expect the full consultation sequence to run against mocked peers and
 # print a final plan matching Part V
 ```
@@ -1365,55 +1427,66 @@ mapping
 ```bash
 curl -N -X POST http://localhost:8080/tickets \
   -H 'content-type: application/json' \
-  -d '{"team": "kora-global", "title": "clampOffsets is slow", ...}'
-# expect to see kora-global's progress stream, not a classification step
+  -d '{"team": "mirrormaker", "title": "findConsumerGroups is slow", ...}'
+# expect to see mirrormaker's progress stream, not a classification step
 ```
 
 **Definition of done for Phase 4:** a ticket explicitly assigned to
-`kora-global` reaches the `kora-global` agent and nothing else, with zero
+`mirrormaker` reaches the `mirrormaker` agent and nothing else, with zero
 domain-classification logic in the router itself.
 
-## 24. Phase 5 — First Three SME Agents (Real Tools, Real Data)
+## 24. Phase 5 — First Four SME Agents (Real Tools, Real Data)
 
-Each of the three agents gets the same test structure, using its own
+Each of the four agents gets the same test structure, using its own
 runbook as the tool specification.
 
-### 24.1 `kora-global` agent
+### 24.1 `mirrormaker` agent
 
-**Build:** `agents/kora_global_agent.py` implementing the four tools from
-[`runbooks/kora-global-sme.md`](./runbooks/kora-global-sme.md)
+**Build:** `agents/mirrormaker_agent.py` implementing the four tools from
+[`runbooks/mirrormaker-sme.md`](./runbooks/mirrormaker-sme.md)
 
 **Unit tests** (MCP calls mocked):
-- `test_get_failover_latency_returns_the_documented_json_shape`
-- `test_get_offset_clamp_trace_returns_phase_breakdown_summing_to_total_ms`
-- `test_own_ticket_produces_an_impact_request_addressed_to_consumer_team`
+- `test_get_checkpoint_latency_returns_the_documented_json_shape`
+- `test_get_group_discovery_trace_returns_phase_breakdown_summing_to_total_ms`
+- `test_own_ticket_produces_impact_requests_addressed_to_all_three_peers`
 
 **Integration tests** (against a real running MCP server):
-- `test_kora_global_tools_successfully_call_real_mcp_endpoints_and_parse_responses`
+- `test_mirrormaker_tools_successfully_call_real_mcp_endpoints_and_parse_responses`
 
-### 24.2 `consumer-team` agent
+### 24.2 `group-coordinator` agent
 
-**Build:** `agents/consumer_team_agent.py` implementing the five tools
-from [`runbooks/consumer-team-sme.md`](./runbooks/consumer-team-sme.md)
+**Build:** `agents/group_coordinator_agent.py` implementing the five tools
+from [`runbooks/group-coordinator-sme.md`](./runbooks/group-coordinator-sme.md)
 
 **Unit tests:**
 - `test_estimate_index_memory_cost_matches_the_documented_formula`
-- `test_consult_about_recognizes_it_needs_oss_kafka_and_issues_a_further_request`
+- `test_consult_about_recognizes_it_needs_kafka_clients_and_issues_a_further_request`
 
 **Integration tests:**
-- `test_consult_about_responds_correctly_to_a_kora_global_impact_request` —
+- `test_consult_about_responds_correctly_to_a_mirrormaker_impact_request` —
   send the exact `ImpactRequest` JSON from §8, assert the response
-  contains `open_questions: ["needs a new Kafka API version — ask oss-kafka"]`
-  **and** that a follow-up `ImpactRequest` to `oss-kafka` was actually sent
+  contains `open_questions: ["needs a new Kafka API version — ask kafka-clients"]`
+  **and** that a follow-up `ImpactRequest` to `kafka-clients` was actually sent
 
-### 24.3 `oss-kafka` agent
+### 24.3 `kafka-broker` agent
 
-**Build:** `agents/oss_kafka_agent.py` implementing the four tools from
-[`runbooks/oss-kafka-sme.md`](./runbooks/oss-kafka-sme.md)
+**Build:** `agents/kafka_broker_agent.py` implementing the four tools from
+[`runbooks/kafka-broker-sme.md`](./runbooks/kafka-broker-sme.md)
+
+**Unit tests:**
+- `test_get_request_routing_reports_a_fan_out_across_all_50_coordinator_shards`
+- `test_consult_about_corrects_the_single_lookup_assumption_in_round_one`
+- `test_kraft_metadata_alternative_is_rejected_citing_the_churn_ratio`
+
+### 24.4 `kafka-clients` agent
+
+**Build:** `agents/kafka_clients_agent.py` implementing the four tools from
+[`runbooks/kafka-clients-sme.md`](./runbooks/kafka-clients-sme.md)
 
 **Unit tests:**
 - `test_search_kips_ranks_kip_518_as_closest_precedent_for_the_fixture_query`
 - `test_check_compat_flags_the_kip_848_compatibility_note`
+- `test_it_is_the_only_agent_that_raises_needs_org_authority`
 
 **Definition of done for Phase 5:** each agent, run standalone against a
 locally running MCP server, produces output matching — in substance, not
@@ -1423,36 +1496,36 @@ word for word — the corresponding agent's step in the Part V walkthrough.
 
 The single most important test in the whole plan: it replays Part V for
 real, against real running services, with no mocked agents anywhere, and
-with `kora-global` genuinely driving the ticket itself.
+with `mirrormaker` genuinely driving the ticket itself.
 
-**Build:** `tests/integration/test_consumer_groups_per_topic_e2e.py`
+**Build:** `tests/integration/test_group_discovery_by_topic_e2e.py`
 
 **Setup:**
 ```bash
-docker compose up -d   # router, all 3 real agents, real MCP server,
-                       # real Knowledge Graph seeded from the 3 runbooks
+docker compose up -d   # router, all 4 real agents, real MCP server,
+                       # real Knowledge Graph seeded from the 4 runbooks
 ```
 
 **Test steps:**
 1. `POST` the exact ticket from Part V to the API Gateway, with
-   `team: kora-global` explicitly set
-2. Confirm the router sends it straight to `kora-global` and nowhere else
-3. Collect the stream of cross-agent messages that `kora-global` triggers
-   on its own — assert `consumer-team` and then `oss-kafka` appear, in
+   `team: mirrormaker` explicitly set
+2. Confirm the router sends it straight to `mirrormaker` and nowhere else
+3. Collect the stream of cross-agent messages that `mirrormaker` triggers
+   on its own — assert `group-coordinator` and then `kafka-clients` appear, in
    that causal order, without either of them being pre-selected by
-   anything other than `kora-global`'s own Knowledge Graph lookup and
-   `consumer-team`'s own follow-up decision
-4. Assert the final plan `kora-global` produces has exactly the five
+   anything other than `mirrormaker`'s own Knowledge Graph lookup and
+   `group-coordinator`'s own follow-up decision
+4. Assert the final plan `mirrormaker` produces has exactly the five
    `execution_order` steps from §11, in the same order
-5. Assert `approvals_needed` contains `consumer-team lead` and
-   `oss-kafka committer`, and `requires_human == true`
+5. Assert `approvals_needed` contains `group-coordinator lead` and
+   `Apache PMC committer`, and `requires_human == true`
 6. Assert every codepath cited across every message in the run passes
    each agent's own ownership self-validation (§21.2) — zero unflagged
    out-of-bounds citations
 
 **Definition of done for Phase 6:** a single command,
 `pytest tests/integration/test_consumer_groups_per_topic_e2e.py -v`,
-passes against the live `docker compose` stack, with `kora-global`
+passes against the live `docker compose` stack, with `mirrormaker`
 genuinely driving its own ticket and genuinely deciding — not being told —
 who else to involve. From this point forward, this test is the permanent
 regression guard for the whole system.
@@ -1486,7 +1559,7 @@ curl -N -X POST http://localhost:8080/tickets \
 ```
 
 **Definition of done for Phase 7:** the manual `curl` command visibly
-streams `kora-global`'s progress rather than blocking silently, and a
+streams `mirrormaker`'s progress rather than blocking silently, and a
 ticket without a team assignment is rejected rather than silently guessed.
 
 ## 27. Phase 8 — Hypothesis Validation Harness
@@ -1527,7 +1600,7 @@ Phase 2 of the rollout (§13) is worth building at all.
 | 2 — Typed Protocol | ~6 | ~3 | — |
 | 3 — Base Agent Framework | ~5 | ~1 | — |
 | 4 — Ticket Router | ~3 | ~1 | — |
-| 5 — Three SME Agents | ~12 (4 per agent) | ~6 (2 per agent) | — |
+| 5 — Four SME Agents | ~16 (4 per agent) | ~8 (2 per agent) | — |
 | 6 — Full Integration | 0 | 1 (but the most important one) | — |
 | 7 — API Gateway | ~4 | ~1 | — |
 | 8 — Hypothesis Validation | ~2 | — | Evaluation harness + scoring report |
@@ -1561,15 +1634,15 @@ Before merging any change that touches a given phase's code:
 ## 30. Why Agents Pick Their Own Model
 
 A network of specialized agents deliberating over three rounds could easily
-become the most expensive way ever devised to answer a bug report. Three agents
+become the most expensive way ever devised to answer a bug report. Four agents
 × three rounds × a frontier model per call is how you end up paying more per
 ticket than the engineer would have cost. So model choice is a first-class
 architectural concern here, not a configuration detail.
 
 The thing that makes this tractable is a property of the design we already
 have: **an SME agent's tools are deterministic API calls, not model calls.**
-When the consumer-team agent computes the memory cost of a topic→group index,
-that is arithmetic over real cluster data. When the oss-kafka agent checks
+When the group-coordinator agent computes the memory cost of a topic→group index,
+that is arithmetic over real cluster data. When the kafka-clients agent checks
 whether `ListGroupsRequest` v6 is wire-compatible, it reads an actual schema
 file. None of that consumes a token, and none of it can be hallucinated.
 
@@ -1591,12 +1664,18 @@ the calls that actually determine output quality still get a capable model.
 Agents declare a *capability tier*. They never name a model:
 
 ```python
-class OssKafkaAgent(SMEAgentBase):
+class KafkaClientsAgent(SMEAgentBase):
     LLM_TIER = "deep"          # wire-compat reasoning is the riskiest call here
 
-class ConsumerTeamAgent(SMEAgentBase):
+class MirrorMakerAgent(SMEAgentBase):
+    LLM_TIER = "standard"      # owns the ticket, synthesizes three teams' input
+
+class GroupCoordinatorAgent(SMEAgentBase):
     LLM_TIER = "small"         # routine work is arithmetic over tool output
     # LLM_DESIGN_TIER = "deep" is inherited — design review escalates per call
+
+class KafkaBrokerAgent(SMEAgentBase):
+    LLM_TIER = "small"         # routing and heap objections are quantitative
 ```
 
 `llm/router.py` resolves a tier to the cheapest model available in the current
@@ -1604,9 +1683,9 @@ environment. Three consequences worth stating:
 
 1. **Model choice becomes a deployment decision.** Swapping the whole org onto
    a different provider is an environment change, not a code change.
-2. **Agents are honest about what they need.** `oss-kafka` is on `deep`
+2. **Agents are honest about what they need.** `kafka-clients` is on `deep`
    because shipping a breaking protocol change to every Kafka client is the
-   worst failure mode in the system. `consumer-team` is on `small` because its
+   worst failure mode in the system. `group-coordinator` is on `small` because its
    routine output is a memory calculation. That asymmetry is deliberate and
    reviewable.
 3. **Cheap by default, strong where it pays.** `LLM_DESIGN_TIER` lets a
@@ -1636,8 +1715,8 @@ export GROQ_API_KEY=...                  # ~14,400 requests/day free
 export GEMINI_API_KEY=... SME_LLM_GEMINI_FREE_TIER=1   # ~1,500 requests/day
 ```
 
-Paid, for reference: the whole three-agent deliberation on Groq's cheapest
-models at each tier costs about **$0.009 per ticket**, or $8.89 per thousand
+Paid, for reference: the whole four-agent deliberation on Groq's cheapest
+models at each tier costs about **$0.010 per ticket**, or $9.70 per thousand
 tickets. Per-ticket LLM cost is not the constraint on this business.
 
 ## 33. Cost Controls
@@ -1659,19 +1738,21 @@ acceptable 1-pager, that is worth knowing — and if it doesn't, you have
 evidence for where model quality genuinely matters rather than an assumption.
 
 `llm/budget.py` enforces a per-ticket ceiling (default $0.50, deliberately far
-above the ~$0.009 expected spend so it only trips on a genuine runaway) and
+above the ~$0.010 expected spend so it only trips on a genuine runaway) and
 attributes every call to an agent, a tier, and a purpose:
 
 ```
-Ticket KAFKA-18231: 6 LLM calls, $0.0089 of $0.50 budget
-  tokens: 24,000 in (71% cached) / 4,200 out
+Ticket KAFKA-18231: 9 LLM calls, $0.0097 of $0.50 budget
+  tokens: 31,000 in (73% cached) / 5,400 out
   by agent:
-    oss-kafka            $0.0058
-    kora-global          $0.0020
-    consumer-team        $0.0010
+    kafka-clients        $0.0058
+    mirrormaker          $0.0020
+    group-coordinator    $0.0010
+    kafka-broker         $0.0009
   by tier:
-    deep                 $0.0078
-    small                $0.0010
+    deep                 $0.0058
+    standard             $0.0020
+    small                $0.0019
 ```
 
 ## 34. Prompt Caching Is Load-Bearing

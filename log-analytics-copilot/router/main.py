@@ -34,10 +34,14 @@ app = FastAPI(title="SME Agent Ticket Router", version="0.1.0")
 
 # Default addresses — override via env vars for local dev / test
 _DEFAULT_ADDRESSES: dict[str, str] = {
-    "kora-global":    os.environ.get("AGENT_ADDR_KORA",     "http://kora-global-agent:8001"),
-    "consumer-team":  os.environ.get("AGENT_ADDR_CONSUMER", "http://consumer-team-agent:8002"),
-    "oss-kafka":      os.environ.get("AGENT_ADDR_OSS",      "http://oss-kafka-agent:8003"),
-    "broker-team":    os.environ.get("AGENT_ADDR_BROKER",   "http://broker-team-agent:8004"),
+    "mirrormaker": os.environ.get(
+        "AGENT_ADDR_MIRRORMAKER", "http://mirrormaker-agent:8001"),
+    "group-coordinator": os.environ.get(
+        "AGENT_ADDR_GROUP_COORDINATOR", "http://group-coordinator-agent:8002"),
+    "kafka-clients": os.environ.get(
+        "AGENT_ADDR_KAFKA_CLIENTS", "http://kafka-clients-agent:8003"),
+    "kafka-broker": os.environ.get(
+        "AGENT_ADDR_KAFKA_BROKER", "http://kafka-broker-agent:8004"),
 }
 
 # Mutable reference so tests can swap it without restarting the app

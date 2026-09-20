@@ -62,13 +62,13 @@ fi
 step "Ensure topic ${TOPIC} exists"
 # ---------------------------------------------------------------------------
 if docker exec "$KAFKA_CONTAINER" \
-     /opt/bitnami/kafka/bin/kafka-topics.sh \
+     /opt/kafka/bin/kafka-topics.sh \
      --bootstrap-server localhost:9092 --list 2>/dev/null \
      | grep -qx "$TOPIC"; then
   ok "topic ${TOPIC} present"
 else
   docker exec "$KAFKA_CONTAINER" \
-    /opt/bitnami/kafka/bin/kafka-topics.sh \
+    /opt/kafka/bin/kafka-topics.sh \
     --bootstrap-server localhost:9092 \
     --create --topic "$TOPIC" --partitions 3 --replication-factor 1 >/dev/null
   ok "created topic ${TOPIC}"
@@ -79,7 +79,7 @@ step "Produce ${N} fake events to ${TOPIC}"
 # ---------------------------------------------------------------------------
 python3 "$ROOT/scripts/produce-fake-logs.py" --count "$N" --seed 42 \
   | docker exec -i "$KAFKA_CONTAINER" \
-      /opt/bitnami/kafka/bin/kafka-console-producer.sh \
+      /opt/kafka/bin/kafka-console-producer.sh \
       --bootstrap-server localhost:9092 \
       --topic "$TOPIC"
 ok "wrote ${N} events"

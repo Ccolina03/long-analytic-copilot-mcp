@@ -6,11 +6,11 @@ real code via DirectTransport (no gRPC server, no Docker needed).
 
 What it proves
 --------------
-1. kora-global receives the ticket and drives the investigation itself.
+1. mirrormaker receives the ticket and drives the investigation itself.
 2. It proposes three genuinely distinct design alternatives before consulting.
-3. It deliberates with consumer-team and oss-kafka over multiple rounds.
-4. consumer-team consults oss-kafka on its own initiative — kora never asked.
-5. consumer-team pushes back substantively, correcting alternative B on a real
+3. It deliberates with group-coordinator and kafka-clients over multiple rounds.
+4. group-coordinator consults kafka-clients on its own initiative — mirrormaker never asked.
+5. group-coordinator pushes back substantively, correcting alternative B on a real
    correctness point rather than rubber-stamping.
 6. The agents converge on a recommendation themselves.
 7. requires_human is True for exactly one reason — the Apache PMC vote — and
@@ -29,10 +29,11 @@ import pathlib
 import pytest
 
 from agents.base_agent import DirectTransport
-from agents.consumer_team_agent import ConsumerTeamAgent
+from agents.group_coordinator_agent import GroupCoordinatorAgent
+from agents.kafka_broker_agent import KafkaBrokerAgent
 from agents.design_doc import render_one_pager
-from agents.kora_global_agent import KoraGlobalAgent
-from agents.oss_kafka_agent import OssKafkaAgent
+from agents.mirrormaker_agent import MirrorMakerAgent
+from agents.kafka_clients_agent import KafkaClientsAgent
 from agents.ownership_validator import validate_citations
 from proto.sme_agents import Ticket
 
@@ -45,28 +46,37 @@ _FIXTURES = pathlib.Path(__file__).parent / "fixtures"
 
 @pytest.fixture(scope="module")
 def network():
-    oss = OssKafkaAgent()
-    consumer = ConsumerTeamAgent(transport=DirectTransport({"oss-kafka": oss}))
-    kora_transport = DirectTransport({"consumer-team": consumer, "oss-kafka": oss})
-    kora = KoraGlobalAgent(transport=kora_transport)
+    clients = KafkaClientsAgent()
+    broker = KafkaBrokerAgent()
+    # group-coordinator consults kafka-clients on its own initiative.
+    coordinator = GroupCoordinatorAgent(
+        transport=DirectTransport({"kafka-clients": clients})
+    )
+    mm_transport = DirectTransport({
+        "group-coordinator": coordinator,
+        "kafka-broker": broker,
+        "kafka-clients": clients,
+    })
+    mirrormaker = MirrorMakerAgent(transport=mm_transport)
     return {
-        "kora": kora,
-        "consumer": consumer,
-        "oss": oss,
-        "kora_transport": kora_transport,
+        "mirrormaker": mirrormaker,
+        "coordinator": coordinator,
+        "broker": broker,
+        "clients": clients,
+        "mm_transport": mm_transport,
     }
 
 
 @pytest.fixture(scope="module")
 def ticket():
-    raw = json.loads((_FIXTURES / "consumer_groups_ticket.json").read_text())
+    raw = json.loads((_FIXTURES / "group_discovery_ticket.json").read_text())
     return Ticket.from_dict(raw)
 
 
 @pytest.fixture(scope="module")
 def finding(network, ticket):
-    """The real Finding produced by kora-global driving its own ticket."""
-    return network["kora"].own_ticket(ticket)
+    """The real Finding produced by mirrormaker driving its own ticket."""
+    return network["mirrormaker"].own_ticket(ticket)
 
 
 @pytest.fixture(scope="module")
@@ -79,17 +89,17 @@ def doc(finding):
 # ---------------------------------------------------------------------------
 
 class TestTicketOwnership:
-    def test_kora_global_owns_the_finding(self, finding):
-        assert finding.owning_agent == "kora-global"
+    def test_mirrormaker_owns_the_finding(self, finding):
+        assert finding.owning_agent == "mirrormaker"
 
     def test_ticket_id_is_preserved(self, finding, ticket):
         assert finding.ticket_id == ticket.ticket_id
 
-    def test_router_would_send_this_to_kora_and_nowhere_else(self, ticket):
+    def test_router_would_send_this_to_mirrormaker_and_nowhere_else(self, ticket):
         from router.main import get_agent_address
         addr = get_agent_address(ticket.team)
         assert addr is not None
-        assert "kora" in addr or "8001" in addr
+        assert "mirrormaker" in addr or "8001" in addr
 
 
 # ---------------------------------------------------------------------------
@@ -138,37 +148,37 @@ class TestThreeAlternatives:
 class TestDeliberation:
     def test_took_more_than_one_round(self, finding):
         assert finding.rounds_used >= 2, (
-            "consumer-team raises real concerns in round 1, so convergence in "
+            "group-coordinator raises real concerns in round 1, so convergence in "
             "round 1 would mean nobody actually pushed back"
         )
 
     def test_stayed_within_the_round_cap(self, finding):
-        assert finding.rounds_used <= KoraGlobalAgent.MAX_DELIBERATION_ROUNDS
+        assert finding.rounds_used <= MirrorMakerAgent.MAX_DELIBERATION_ROUNDS
 
     def test_converged(self, finding):
         assert finding.converged is True
 
     def test_both_peers_were_consulted(self, finding):
         consulted = {r.to_agent for r in finding.deliberation}
-        assert "consumer-team" in consulted
-        assert "oss-kafka" in consulted
+        assert "group-coordinator" in consulted
+        assert "kafka-clients" in consulted
 
     def test_consumer_team_consulted_before_oss_kafka(self, finding):
         order = [r.to_agent for r in finding.deliberation]
-        assert order.index("consumer-team") < order.index("oss-kafka")
+        assert order.index("group-coordinator") < order.index("kafka-clients")
 
     def test_consumer_team_consulted_oss_kafka_on_its_own_initiative(self, network, ticket):
-        """kora-global never told consumer-team to ask oss-kafka."""
-        consumer = network["consumer"]
+        """mirrormaker never told group-coordinator to ask kafka-clients."""
+        coordinator = network["coordinator"]
         from proto.sme_agents import ImpactRequest
         req = ImpactRequest.new(
-            from_agent="kora-global", to_agent="consumer-team",
+            from_agent="mirrormaker", to_agent="group-coordinator",
             ticket_id=ticket.ticket_id, request_type="design_review",
-            question="Is the index implementable?",  # says nothing about oss-kafka
+            question="Is the index implementable?",  # says nothing about kafka-clients
             round_number=1,
         )
-        resp = consumer.consult_about(req, depth=0)
-        assert "oss-kafka" in resp.follow_up_consultations
+        resp = coordinator.consult_about(req, depth=0)
+        assert "kafka-clients" in resp.follow_up_consultations
 
     def test_new_concerns_were_raised_during_deliberation(self, finding):
         assert any(r.new_concerns_raised for r in finding.deliberation), (
@@ -192,24 +202,60 @@ class TestDeliberation:
 # ---------------------------------------------------------------------------
 
 class TestSubstantivePushback:
-    def test_consumer_team_corrected_kora_on_a_correctness_point(self, network, ticket):
-        """consumer-team must catch that commits != live subscriptions."""
+    def test_coordinator_corrected_mirrormaker_on_a_correctness_point(self, network, ticket):
+        """group-coordinator must catch that commits != live subscriptions."""
         from proto.sme_agents import ImpactRequest
         req = ImpactRequest.new(
-            from_agent="kora-global", to_agent="consumer-team",
+            from_agent="mirrormaker", to_agent="group-coordinator",
             ticket_id=ticket.ticket_id, request_type="design_review",
             question="review my alternatives", round_number=1,
         )
-        resp = network["consumer"].consult_about(req, depth=0)
+        resp = network["coordinator"].consult_about(req, depth=0)
         joined = " ".join(resp.new_concerns).lower()
         assert "__consumer_offsets" in joined
         assert "subscription" in joined
 
+    def test_broker_corrected_the_fan_out_assumption(self, network, ticket):
+        """The reason kafka-broker is a separate team.
+
+        Every other agent frames this as "replace an O(n) scan with an O(1)
+        lookup". Only the broker team owns the fact that group→coordinator
+        placement is by group-id hash, so a filtered ListGroups still has to
+        fan out to all 50 shards. Nobody else can catch that.
+        """
+        from proto.sme_agents import ImpactRequest
+        req = ImpactRequest.new(
+            from_agent="mirrormaker", to_agent="kafka-broker",
+            ticket_id=ticket.ticket_id, request_type="design_review",
+            question="how does a filtered ListGroups route?", round_number=1,
+        )
+        resp = network["broker"].consult_about(req, depth=0)
+        joined = (" ".join(resp.new_concerns) + resp.principal_review).lower()
+        assert "fan out" in joined or "fan-out" in joined
+        assert "hash" in joined
+        assert "50" in joined
+
+    def test_broker_rejected_kraft_metadata_with_a_measured_reason(
+        self, network, ticket
+    ):
+        """Rejections must cite numbers, not instinct."""
+        from proto.sme_agents import ImpactRequest
+        req = ImpactRequest.new(
+            from_agent="mirrormaker", to_agent="kafka-broker",
+            ticket_id=ticket.ticket_id, request_type="design_review",
+            question="should this live in KRaft metadata?", round_number=1,
+        )
+        resp = network["broker"].consult_about(req, depth=0)
+        kraft = [a for a in resp.design_alternatives if "KRaft" in a.name]
+        assert len(kraft) == 1
+        assert kraft[0].is_ruled_out
+        assert "32x" in kraft[0].rejected_reason
+
     def test_every_agent_produced_a_principal_review(self, network, ticket):
         from proto.sme_agents import ImpactRequest
-        for agent_key, agent_name in (("consumer", "consumer-team"), ("oss", "oss-kafka")):
+        for agent_key, agent_name in (("coordinator", "group-coordinator"), ("broker", "kafka-broker"), ("clients", "kafka-clients")):
             req = ImpactRequest.new(
-                from_agent="kora-global", to_agent=agent_name,
+                from_agent="mirrormaker", to_agent=agent_name,
                 ticket_id=ticket.ticket_id, request_type="design_review",
                 question="deep review please", round_number=1,
             )
@@ -235,7 +281,7 @@ class TestHumanEscalationIsEndOnlyAndMinimal:
     def test_the_escalation_is_the_apache_pmc_vote(self, finding):
         point = finding.human_decision_points[0].lower()
         assert "pmc" in point or "vote" in point
-        assert "oss-kafka" in point
+        assert "kafka-clients" in point
 
     def test_escalation_is_not_caused_by_non_convergence(self, finding):
         assert not any("did not converge" in p for p in finding.human_decision_points)
@@ -266,8 +312,10 @@ class TestOnePagerContent:
         assert rec is not None
         assert rec.name in finding.tldr
 
-    def test_background_explains_what_cluster_linking_is(self, finding):
-        assert "cluster linking" in finding.background.lower()
+    def test_background_explains_what_mirrormaker_does(self, finding):
+        background = finding.background.lower()
+        assert "mirrormaker" in background
+        assert "replicat" in background
         assert len(finding.background) > 500
 
     def test_has_goals_and_non_goals(self, finding):
@@ -281,10 +329,11 @@ class TestOnePagerContent:
     def test_has_five_execution_steps(self, finding):
         assert len(finding.execution_order) == 5
 
-    def test_testing_strategy_aggregates_all_three_teams(self, finding):
+    def test_testing_strategy_aggregates_all_four_teams(self, finding):
         joined = " ".join(finding.testing_strategy)
-        for team in ("kora-global", "consumer-team", "oss-kafka"):
-            assert team in joined
+        for team in ("mirrormaker", "group-coordinator", "kafka-broker",
+                     "kafka-clients"):
+            assert team in joined, f"{team} contributed no test requirements"
 
     def test_has_risks_rollout_and_success_metrics(self, finding):
         assert len(finding.risks_and_mitigations) >= 3
@@ -293,9 +342,9 @@ class TestOnePagerContent:
 
     def test_teams_involved_covers_four_teams_with_roles(self, finding):
         teams = {t.team: t for t in finding.teams_involved}
-        assert {"kora-global", "consumer-team", "oss-kafka", "broker-team"} <= set(teams)
-        assert teams["kora-global"].role == "owner"
-        assert teams["oss-kafka"].sign_off_required is True
+        assert {"mirrormaker", "group-coordinator", "kafka-clients", "kafka-broker"} <= set(teams)
+        assert teams["mirrormaker"].role == "owner"
+        assert teams["kafka-clients"].sign_off_required is True
 
 
 # ---------------------------------------------------------------------------
@@ -303,13 +352,13 @@ class TestOnePagerContent:
 # ---------------------------------------------------------------------------
 
 class TestOwnershipDiscipline:
-    def test_kora_cited_only_what_it_owns(self, finding):
-        results = validate_citations(finding.cited_codepaths, KoraGlobalAgent.OWNS)
+    def test_mirrormaker_cited_only_what_it_owns(self, finding):
+        results = validate_citations(finding.cited_codepaths, MirrorMakerAgent.OWNS)
         assert [r.codepath for r in results if not r.owned] == []
 
     def test_each_agents_alternatives_are_attributed_correctly(self, finding):
         for alt in finding.design_alternatives:
-            assert alt.proposed_by == "kora-global"
+            assert alt.proposed_by == "mirrormaker"
 
     def test_no_unflagged_out_of_bounds_citations_anywhere(self, finding):
         """§25 step 6 — zero unflagged ownership violations in the whole run."""
@@ -347,4 +396,4 @@ class TestRenderedDocument:
 
     def test_deliberation_record_shows_the_rounds(self, doc):
         assert "| Round | From | To | Verdict |" in doc
-        assert "Round 1, `kora-global` → `consumer-team`" in doc
+        assert "Round 1, `mirrormaker` → `group-coordinator`" in doc

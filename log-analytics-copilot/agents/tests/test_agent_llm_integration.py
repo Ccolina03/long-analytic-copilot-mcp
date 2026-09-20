@@ -13,10 +13,10 @@ from __future__ import annotations
 import pytest
 
 from agents.base_agent import DirectTransport, SMEAgentBase
-from agents.consumer_team_agent import ConsumerTeamAgent
+from agents.group_coordinator_agent import GroupCoordinatorAgent
 from agents.design_doc import render_one_pager
-from agents.kora_global_agent import KoraGlobalAgent
-from agents.oss_kafka_agent import OssKafkaAgent
+from agents.mirrormaker_agent import MirrorMakerAgent
+from agents.kafka_clients_agent import KafkaClientsAgent
 from llm.budget import TicketBudget
 from llm.client import AgentLLM
 from llm.provider import LLMProvider, LLMResponse
@@ -66,32 +66,32 @@ def ticket() -> Ticket:
             "Today this requires listing all groups and describing each one, "
             "which is O(groups) and times out on large clusters."
         ),
-        team="kora-global",
+        team="mirrormaker",
     )
 
 
 def build_network(llms: dict[str, AgentLLM] | None = None):
     """Wire the three real agents together, optionally with LLM handles."""
     llms = llms or {}
-    kora = KoraGlobalAgent(llm=llms.get("kora-global"))
-    consumer = ConsumerTeamAgent(llm=llms.get("consumer-team"))
-    oss = OssKafkaAgent(llm=llms.get("oss-kafka"))
+    mirrormaker = MirrorMakerAgent(llm=llms.get("mirrormaker"))
+    coordinator = GroupCoordinatorAgent(llm=llms.get("group-coordinator"))
+    clients = KafkaClientsAgent(llm=llms.get("kafka-clients"))
 
     peers = {
-        "kora-global": kora,
-        "consumer-team": consumer,
-        "oss-kafka": oss,
+        "mirrormaker": mirrormaker,
+        "group-coordinator": coordinator,
+        "kafka-clients": clients,
     }
     for agent in peers.values():
         agent._transport = DirectTransport(peers)
-    return kora, consumer, oss
+    return mirrormaker, coordinator, clients
 
 
 def scripted_llms(text: str, budget: TicketBudget | None = None):
     """An LLM handle per agent, all backed by the same scripted response."""
     providers = {}
     handles = {}
-    for agent_id in ("kora-global", "consumer-team", "oss-kafka"):
+    for agent_id in ("mirrormaker", "group-coordinator", "kafka-clients"):
         scripted = ScriptedProvider(default=text)
         providers[agent_id] = scripted
         handles[agent_id] = AgentLLM(
@@ -109,21 +109,21 @@ def scripted_llms(text: str, budget: TicketBudget | None = None):
 
 class TestZeroConfigDefault:
     def test_agents_report_llm_disabled_by_default(self):
-        kora, consumer, oss = build_network()
-        assert not kora.llm_enabled
-        assert not consumer.llm_enabled
-        assert not oss.llm_enabled
+        mirrormaker, coordinator, clients = build_network()
+        assert not mirrormaker.llm_enabled
+        assert not coordinator.llm_enabled
+        assert not clients.llm_enabled
 
     def test_full_deliberation_runs_with_no_model(self, ticket):
-        kora, _, _ = build_network()
-        finding = kora.own_ticket(ticket)
+        mirrormaker, _, _ = build_network()
+        finding = mirrormaker.own_ticket(ticket)
         assert finding.rounds_used >= 1
         assert len(finding.design_alternatives) >= 3
 
     def test_authored_content_is_still_substantive(self, ticket):
         """No model must not mean an empty doc."""
-        kora, _, _ = build_network()
-        finding = kora.own_ticket(ticket)
+        mirrormaker, _, _ = build_network()
+        finding = mirrormaker.own_ticket(ticket)
         assert finding.tldr
         assert finding.background
         assert finding.goals
@@ -132,10 +132,10 @@ class TestZeroConfigDefault:
 
     def test_costs_nothing(self, ticket):
         budget = TicketBudget(ticket.ticket_id)
-        kora, consumer, oss = build_network()
-        for agent in (kora, consumer, oss):
+        mirrormaker, coordinator, clients = build_network()
+        for agent in (mirrormaker, coordinator, clients):
             agent.attach_budget(budget)
-        kora.own_ticket(ticket)
+        mirrormaker.own_ticket(ticket)
         assert budget.total_cost_usd == 0.0
         assert budget.call_count == 0
         assert "authored fallback" in budget.summary()
@@ -148,28 +148,28 @@ class TestZeroConfigDefault:
 class TestAgentTiers:
     def test_oss_kafka_uses_the_deep_tier(self):
         """Wire-protocol compatibility is the highest-stakes call in the network."""
-        assert OssKafkaAgent.LLM_TIER == "deep"
+        assert KafkaClientsAgent.LLM_TIER == "deep"
 
     def test_consumer_team_uses_a_cheap_tier_for_routine_work(self):
-        assert ConsumerTeamAgent.LLM_TIER == "small"
+        assert GroupCoordinatorAgent.LLM_TIER == "small"
 
     def test_every_agent_declares_a_valid_tier(self):
         from llm.registry import TIERS
-        for cls in (KoraGlobalAgent, ConsumerTeamAgent, OssKafkaAgent):
+        for cls in (MirrorMakerAgent, GroupCoordinatorAgent, KafkaClientsAgent):
             assert cls.LLM_TIER in TIERS
             assert cls.LLM_DESIGN_TIER in TIERS
 
     def test_design_tier_is_never_weaker_than_routine_tier(self):
         from llm.registry import tier_index
-        for cls in (KoraGlobalAgent, ConsumerTeamAgent, OssKafkaAgent):
+        for cls in (MirrorMakerAgent, GroupCoordinatorAgent, KafkaClientsAgent):
             assert tier_index(cls.LLM_DESIGN_TIER) >= tier_index(cls.LLM_TIER), (
                 f"{cls.__name__} would downgrade for design review"
             )
 
     def test_cheap_tier_agents_still_escalate_for_design_review(self):
         """The cost story: cheap by default, strong only where it matters."""
-        assert ConsumerTeamAgent.LLM_TIER != ConsumerTeamAgent.LLM_DESIGN_TIER
-        assert ConsumerTeamAgent.LLM_DESIGN_TIER == "deep"
+        assert GroupCoordinatorAgent.LLM_TIER != GroupCoordinatorAgent.LLM_DESIGN_TIER
+        assert GroupCoordinatorAgent.LLM_DESIGN_TIER == "deep"
 
 
 # ---------------------------------------------------------------------------
@@ -178,35 +178,35 @@ class TestAgentTiers:
 
 class TestRolePrompt:
     def test_names_the_agent_and_domain(self):
-        prompt = OssKafkaAgent()._role_prompt()
-        assert "oss-kafka" in prompt
-        assert "Apache Kafka protocol" in prompt
+        prompt = KafkaClientsAgent()._role_prompt()
+        assert "kafka-clients" in prompt
+        assert "Apache Kafka wire protocol" in prompt
 
     def test_lists_owned_codepaths(self):
-        prompt = ConsumerTeamAgent()._role_prompt()
-        assert "GroupCoordinator.scala" in prompt
+        prompt = GroupCoordinatorAgent()._role_prompt()
+        assert "GroupMetadataManager.java" in prompt
 
     def test_lists_available_tools(self):
-        prompt = OssKafkaAgent()._role_prompt()
+        prompt = KafkaClientsAgent()._role_prompt()
         assert "search_kips" in prompt
 
     def test_states_the_ownership_constraint(self):
         """The guardrail against agents speculating about others' code."""
-        prompt = KoraGlobalAgent()._role_prompt()
+        prompt = MirrorMakerAgent()._role_prompt()
         assert "authoritative" in prompt
         assert "needs verification" in prompt.lower()
 
     def test_forbids_escalating_merely_hard_problems(self):
-        prompt = KoraGlobalAgent()._role_prompt()
+        prompt = MirrorMakerAgent()._role_prompt()
         assert "organizational authority" in prompt
 
     def test_is_stable_across_calls(self):
         """Must be byte-identical or prompt caching never hits."""
-        agent = OssKafkaAgent()
+        agent = KafkaClientsAgent()
         assert agent._role_prompt() == agent._role_prompt()
 
     def test_differs_between_agents(self):
-        assert KoraGlobalAgent()._role_prompt() != OssKafkaAgent()._role_prompt()
+        assert MirrorMakerAgent()._role_prompt() != KafkaClientsAgent()._role_prompt()
 
     def test_agent_with_no_ownership_declares_none(self):
         class Bare(SMEAgentBase):
@@ -228,7 +228,7 @@ class TestReviewEnrichment:
         """Ask ``agent`` for a review, the way a peer agent would."""
         from proto.sme_agents import ImpactRequest
         request = ImpactRequest.new(
-            from_agent="kora-global",
+            from_agent="mirrormaker",
             to_agent=agent.AGENT_NAME,
             ticket_id=ticket.ticket_id,
             request_type="design_review",
@@ -242,9 +242,9 @@ class TestReviewEnrichment:
         monkeypatch.delenv("SME_LLM_DISABLE", raising=False)
         enriched = "ENRICHED: the index write path is the real constraint here."
         handles, _ = scripted_llms(enriched)
-        _, consumer, _ = build_network(handles)
+        _, coordinator, _ = build_network(handles)
 
-        response = self._consult(consumer, ticket)
+        response = self._consult(coordinator, ticket)
         assert response.principal_review == enriched
 
     def test_verdicts_are_not_touched_by_the_model(self, monkeypatch, ticket):
@@ -291,11 +291,11 @@ class TestReviewEnrichment:
         """Enrichment must be grounded, not free invention."""
         monkeypatch.delenv("SME_LLM_DISABLE", raising=False)
         handles, providers = scripted_llms("ok")
-        kora, _, _ = build_network(handles)
-        kora.own_ticket(ticket)
+        mirrormaker, _, _ = build_network(handles)
+        mirrormaker.own_ticket(ticket)
 
-        consumer_calls = providers["consumer-team"].calls
-        assert consumer_calls, "consumer-team should have been asked to review"
+        consumer_calls = providers["group-coordinator"].calls
+        assert consumer_calls, "group-coordinator should have been asked to review"
         prompt = "\n".join(
             m["content"] for m in consumer_calls[0]["messages"]
         )
@@ -305,11 +305,11 @@ class TestReviewEnrichment:
     def test_prompt_carries_the_round_number(self, monkeypatch, ticket):
         monkeypatch.delenv("SME_LLM_DISABLE", raising=False)
         handles, providers = scripted_llms("ok")
-        kora, _, _ = build_network(handles)
-        kora.own_ticket(ticket)
+        mirrormaker, _, _ = build_network(handles)
+        mirrormaker.own_ticket(ticket)
 
         prompt = "\n".join(
-            m["content"] for m in providers["consumer-team"].calls[0]["messages"]
+            m["content"] for m in providers["group-coordinator"].calls[0]["messages"]
         )
         assert "deliberation round" in prompt.lower()
 
@@ -317,10 +317,10 @@ class TestReviewEnrichment:
         """The prompt-cache property, verified on real agent traffic."""
         monkeypatch.delenv("SME_LLM_DISABLE", raising=False)
         handles, providers = scripted_llms("ok")
-        kora, _, _ = build_network(handles)
-        kora.own_ticket(ticket)
+        mirrormaker, _, _ = build_network(handles)
+        mirrormaker.own_ticket(ticket)
 
-        calls = providers["consumer-team"].calls
+        calls = providers["group-coordinator"].calls
         if len(calls) < 2:
             pytest.skip("deliberation converged in one round")
 
@@ -334,8 +334,8 @@ class TestReviewEnrichment:
         monkeypatch.delenv("SME_LLM_DISABLE", raising=False)
         budget = TicketBudget(ticket.ticket_id)
         handles, _ = scripted_llms("ok", budget=budget)
-        kora, _, _ = build_network(handles)
-        kora.own_ticket(ticket)
+        mirrormaker, _, _ = build_network(handles)
+        mirrormaker.own_ticket(ticket)
 
         assert budget.call_count > 0
         assert all(c.tier == "deep" for c in budget.calls), (
@@ -346,8 +346,8 @@ class TestReviewEnrichment:
         monkeypatch.delenv("SME_LLM_DISABLE", raising=False)
         budget = TicketBudget(ticket.ticket_id)
         handles, _ = scripted_llms("ok", budget=budget)
-        kora, _, _ = build_network(handles)
-        kora.own_ticket(ticket)
+        mirrormaker, _, _ = build_network(handles)
+        mirrormaker.own_ticket(ticket)
         assert all(c.purpose.startswith("principal_review:round") for c in budget.calls)
 
 
@@ -362,14 +362,14 @@ class TestGracefulDegradation:
                 agent_id, tier="nano",
                 router=ModelRouter({"groq": _Backed(FailingProvider())}),
             )
-            for agent_id in ("kora-global", "consumer-team", "oss-kafka")
+            for agent_id in ("mirrormaker", "group-coordinator", "kafka-clients")
         }
         return build_network(handles)
 
     def test_provider_outage_does_not_fail_the_ticket(self, monkeypatch, ticket):
         monkeypatch.delenv("SME_LLM_DISABLE", raising=False)
-        kora, _, _ = self._failing_network()
-        finding = kora.own_ticket(ticket)   # must not raise
+        mirrormaker, _, _ = self._failing_network()
+        finding = mirrormaker.own_ticket(ticket)   # must not raise
         assert finding.ticket_id == ticket.ticket_id
 
     def test_outage_falls_back_to_authored_content(self, monkeypatch, ticket):
@@ -381,7 +381,7 @@ class TestGracefulDegradation:
 
         def review(agent):
             return agent.consult_about(ImpactRequest.new(
-                from_agent="kora-global", to_agent=agent.AGENT_NAME,
+                from_agent="mirrormaker", to_agent=agent.AGENT_NAME,
                 ticket_id=ticket.ticket_id, request_type="design_review",
                 context=ticket.description, question="Review please.",
             )).principal_review
@@ -416,8 +416,8 @@ class TestGracefulDegradation:
         monkeypatch.delenv("SME_LLM_DISABLE", raising=False)
         budget = TicketBudget(ticket.ticket_id, limit_usd=0.0)
         handles, _ = scripted_llms("should not appear", budget=budget)
-        kora, _, _ = build_network(handles)
-        finding = kora.own_ticket(ticket)   # must not raise
+        mirrormaker, _, _ = build_network(handles)
+        finding = mirrormaker.own_ticket(ticket)   # must not raise
         assert finding.design_alternatives
 
 
@@ -482,8 +482,8 @@ class TestTicketCost:
         monkeypatch.delenv("SME_LLM_DISABLE", raising=False)
         budget = TicketBudget(ticket.ticket_id)
         handles, _ = scripted_llms("a" * 3000, budget=budget)
-        kora, _, _ = build_network(handles)
-        kora.own_ticket(ticket)
+        mirrormaker, _, _ = build_network(handles)
+        mirrormaker.own_ticket(ticket)
 
         from llm.registry import get_model
         model = get_model("openai/gpt-oss-120b", "groq")
@@ -501,9 +501,9 @@ class TestTicketCost:
         monkeypatch.delenv("SME_LLM_DISABLE", raising=False)
         budget = TicketBudget(ticket.ticket_id)
         handles, _ = scripted_llms("ok", budget=budget)
-        kora, _, _ = build_network(handles)
-        kora.own_ticket(ticket)
+        mirrormaker, _, _ = build_network(handles)
+        mirrormaker.own_ticket(ticket)
 
         by_agent = budget.cost_by_agent()
-        assert "consumer-team" in by_agent
-        assert "oss-kafka" in by_agent
+        assert "group-coordinator" in by_agent
+        assert "kafka-clients" in by_agent

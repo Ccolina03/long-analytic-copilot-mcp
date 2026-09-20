@@ -1,35 +1,35 @@
 """
-Phase 5 / consumer-team agent tests.
+Phase 5 / group-coordinator agent tests.
 
 Covers the five tools, the three implementation alternatives for the index,
 and the round-aware consultation behaviour including the substantive
-correctness pushback on kora-global's alternative B.
+correctness pushback on mirrormaker's alternative B.
 """
 
 import pytest
 
 from agents.base_agent import DirectTransport, NullTransport
-from agents.consumer_team_agent import ConsumerTeamAgent
-from agents.oss_kafka_agent import OssKafkaAgent
+from agents.group_coordinator_agent import GroupCoordinatorAgent
+from agents.kafka_clients_agent import KafkaClientsAgent
 from agents.ownership_validator import validate_citations
 from proto.sme_agents import ImpactRequest
 
 
 @pytest.fixture
 def agent():
-    """Consumer team wired to a real oss-kafka agent."""
-    return ConsumerTeamAgent(transport=DirectTransport({"oss-kafka": OssKafkaAgent()}))
+    """Consumer team wired to a real kafka-clients agent."""
+    return GroupCoordinatorAgent(transport=DirectTransport({"kafka-clients": KafkaClientsAgent()}))
 
 
 def _request(round_number: int = 1) -> ImpactRequest:
     return ImpactRequest.new(
-        from_agent="kora-global",
-        to_agent="consumer-team",
+        from_agent="mirrormaker",
+        to_agent="group-coordinator",
         ticket_id="t-consumer-1",
         request_type="design_review",
-        context="clampOffsets p99 = 11,400ms on a cluster with 50,312 groups.",
+        context="Checkpoint group discovery p99 = 11,400ms on a cluster with 50,312 groups.",
         question="Is a reverse index implementable on your side?",
-        codepaths_of_interest=["GroupCoordinator.scala"],
+        codepaths_of_interest=["GroupMetadataManager.java"],
         round_number=round_number,
     )
 
@@ -40,7 +40,7 @@ def _request(round_number: int = 1) -> ImpactRequest:
 
 class TestConsumerTeamTools:
     def setup_method(self):
-        self.agent = ConsumerTeamAgent()
+        self.agent = GroupCoordinatorAgent()
 
     def test_memory_cost_matches_documented_formula(self):
         """50k groups x 8 subs x 36 bytes ≈ 13.7 MB."""
@@ -101,7 +101,7 @@ class TestConsumerTeamTools:
 
 class TestConsumerTeamAlternatives:
     def setup_method(self):
-        a = ConsumerTeamAgent()
+        a = GroupCoordinatorAgent()
         self.alts = a._index_alternatives(
             a.estimate_index_memory_cost(50_000, 8),
             a.get_rebalance_history("orders"),
@@ -111,7 +111,7 @@ class TestConsumerTeamAlternatives:
         assert len(self.alts) == 3
 
     def test_all_proposed_by_consumer_team(self):
-        assert all(a.proposed_by == "consumer-team" for a in self.alts)
+        assert all(a.proposed_by == "group-coordinator" for a in self.alts)
 
     def test_every_alternative_has_depth(self):
         for alt in self.alts:
@@ -145,7 +145,7 @@ class TestConsumerTeamConsultAbout:
         assert resp.verdict == "needs_changes"
         assert len(resp.new_concerns) >= 3
 
-    def test_round_one_corrects_kora_alternative_b_on_correctness(self, agent):
+    def test_round_one_corrects_mirrormaker_alternative_b_on_correctness(self, agent):
         """The substantive principal-engineer pushback: commits != subscriptions."""
         resp = agent.consult_about(_request(1), depth=0)
         joined = " ".join(resp.new_concerns).lower()
@@ -155,7 +155,7 @@ class TestConsumerTeamConsultAbout:
 
     def test_round_one_consults_oss_kafka_on_own_initiative(self, agent):
         resp = agent.consult_about(_request(1), depth=0)
-        assert "oss-kafka" in resp.follow_up_consultations
+        assert "kafka-clients" in resp.follow_up_consultations
 
     def test_round_three_agrees(self, agent):
         resp = agent.consult_about(_request(3), depth=0)
@@ -181,7 +181,7 @@ class TestConsumerTeamConsultAbout:
 
     def test_cites_only_codepaths_it_owns(self, agent):
         resp = agent.consult_about(_request(1), depth=0)
-        results = validate_citations(resp.cited_codepaths, ConsumerTeamAgent.OWNS)
+        results = validate_citations(resp.cited_codepaths, GroupCoordinatorAgent.OWNS)
         assert [r.codepath for r in results if not r.owned] == []
 
     def test_supplies_its_own_test_requirements(self, agent):
@@ -189,14 +189,14 @@ class TestConsumerTeamConsultAbout:
         assert len(resp.test_requirements) >= 5
 
     def test_does_not_claim_org_authority_for_itself(self, agent):
-        """The KIP vote is oss-kafka's gate, not consumer-team's."""
+        """The KIP vote is kafka-clients's gate, not group-coordinator's."""
         resp = agent.consult_about(_request(1), depth=0)
         assert resp.needs_org_authority is False
 
     def test_still_responds_when_oss_kafka_unreachable(self):
-        agent = ConsumerTeamAgent(transport=NullTransport())
+        agent = GroupCoordinatorAgent(transport=NullTransport())
         resp = agent.consult_about(_request(1), depth=0)
-        assert resp.from_agent == "consumer-team"
+        assert resp.from_agent == "group-coordinator"
         assert resp.verdict == "needs_changes"
         assert any("unreachable" in q.lower() or "unconfirmed" in q.lower()
                    for q in resp.open_questions)

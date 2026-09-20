@@ -1,10 +1,12 @@
 # CODEOWNERS — sample fixture used by knowledge-graph tests
 # Pattern                                           Owner(s)
 
-/confluent/kora-cluster-linking/                   @kora-global
-/apache/kafka/core/src/main/scala/kafka/coordinator/ @consumer-team
-/apache/kafka/clients/src/main/resources/common/message/ @oss-kafka
-/apache/kafka/clients/src/main/java/               @oss-kafka
+/connect/mirror/src/main/java/org/apache/kafka/connect/mirror/ @mirrormaker
+/group-coordinator/src/main/java/org/apache/kafka/coordinator/group/ @group-coordinator
+/clients/src/main/resources/common/message/        @kafka-clients
+/clients/src/main/java/org/apache/kafka/clients/admin/ @kafka-clients
+/core/src/main/scala/kafka/server/                 @kafka-broker
+/metadata/src/main/java/org/apache/kafka/controller/ @kafka-broker
 
 # Wildcard example
 *.proto                                            @platform-team

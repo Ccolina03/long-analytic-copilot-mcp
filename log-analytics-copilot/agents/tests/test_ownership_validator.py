@@ -23,14 +23,14 @@ from agents.ownership_validator import (
 
 
 class TestValidateCitations:
-    _KORA_OWNS = [
-        "confluent/kora-cluster-linking/",
-        "OffsetClampingService.java",
-        "FailoverCoordinator.java",
+    _MM_OWNS = [
+        "connect/mirror/src/main/java/org/apache/kafka/connect/mirror/",
+        "MirrorCheckpointConnector.java",
+        "MirrorCheckpointTask.java",
     ]
 
     def test_exact_path_passes(self):
-        results = validate_citations(["OffsetClampingService.java"], self._KORA_OWNS)
+        results = validate_citations(["MirrorCheckpointConnector.java"], self._MM_OWNS)
         assert len(results) == 1
         assert results[0].owned is True
         assert results[0].status == "owned"
@@ -38,32 +38,32 @@ class TestValidateCitations:
     def test_prefix_path_passes(self):
         # Sub-path of an owned directory
         results = validate_citations(
-            ["confluent/kora-cluster-linking/src/FailoverCoordinator.java"],
-            self._KORA_OWNS,
+            ["connect/mirror/src/main/java/org/apache/kafka/connect/mirror/src/MirrorCheckpointTask.java"],
+            self._MM_OWNS,
         )
         assert results[0].owned is True
 
     def test_citation_outside_owned_paths_is_flagged(self):
         results = validate_citations(
-            ["GroupCoordinator.scala"],  # belongs to consumer-team, not kora
-            self._KORA_OWNS,
+            ["GroupMetadataManager.java"],  # belongs to group-coordinator, not mirrormaker
+            self._MM_OWNS,
         )
         assert results[0].owned is False
         assert results[0].status == "needs_verification"
 
     def test_empty_codepaths_returns_empty_list(self):
-        assert validate_citations([], self._KORA_OWNS) == []
+        assert validate_citations([], self._MM_OWNS) == []
 
     def test_empty_owns_list_flags_everything(self):
         results = validate_citations(["SomeFile.java"], [])
         assert results[0].owned is False
 
     def test_matched_pattern_is_populated(self):
-        results = validate_citations(["OffsetClampingService.java"], self._KORA_OWNS)
-        assert results[0].matched_pattern == "OffsetClampingService.java"
+        results = validate_citations(["MirrorCheckpointConnector.java"], self._MM_OWNS)
+        assert results[0].matched_pattern == "MirrorCheckpointConnector.java"
 
     def test_unmatched_pattern_is_empty_string(self):
-        results = validate_citations(["SomeUnknownFile.java"], self._KORA_OWNS)
+        results = validate_citations(["SomeUnknownFile.java"], self._MM_OWNS)
         assert results[0].matched_pattern == ""
 
 
@@ -94,23 +94,23 @@ class TestHelpers:
 
 
 class TestConsumerTeamRunbookFixture:
-    """§21.2 integration check: consumer-team's OWNS list."""
+    """§21.2 integration check: group-coordinator's OWNS list."""
 
     _CONSUMER_OWNS = [
         "apache/kafka/core/src/main/scala/kafka/coordinator/group/",
-        "GroupCoordinator.scala",
-        "GroupMetadata.scala",
+        "GroupMetadataManager.java",
+        "GroupCoordinatorShard.java",
         "TopicPartitionGroupIndex.java",
     ]
 
     def test_gc_scala_is_owned_by_consumer_team(self):
-        results = validate_citations(["GroupCoordinator.scala"], self._CONSUMER_OWNS)
+        results = validate_citations(["GroupMetadataManager.java"], self._CONSUMER_OWNS)
         assert results[0].owned is True
 
     def test_offset_clamping_service_is_not_owned_by_consumer_team(self):
-        """OffsetClampingService.java belongs to kora-global, not consumer-team."""
+        """MirrorCheckpointConnector.java belongs to mirrormaker, not group-coordinator."""
         results = validate_citations(
-            ["OffsetClampingService.java"], self._CONSUMER_OWNS
+            ["MirrorCheckpointConnector.java"], self._CONSUMER_OWNS
         )
         assert results[0].owned is False
         assert results[0].status == "needs_verification"
@@ -118,7 +118,7 @@ class TestConsumerTeamRunbookFixture:
     def test_group_coordinator_full_path_matches_prefix_pattern(self):
         full_path = (
             "apache/kafka/core/src/main/scala/kafka/coordinator/group/"
-            "GroupCoordinator.scala"
+            "GroupMetadataManager.java"
         )
         results = validate_citations([full_path], self._CONSUMER_OWNS)
         assert results[0].owned is True

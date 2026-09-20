@@ -12,7 +12,7 @@ Usage::
     conn = get_connection()
     apply_schema(conn)
     conn.execute("INSERT INTO entities (name, entity_type) VALUES (?, ?)",
-                 ("kora-global", "team"))
+                 ("mirrormaker", "team"))
     conn.commit()
 
 Both backends expose the same ``sqlite3.Connection``-compatible interface for

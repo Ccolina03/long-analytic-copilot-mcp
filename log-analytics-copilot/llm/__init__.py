@@ -21,7 +21,7 @@ Quick start — free hosted tier:
 
 Pin one agent to a stronger model where quality actually pays off:
 
-    export SME_LLM_MODEL_oss_kafka=groq/llama-3.3-70b-versatile
+    export SME_LLM_MODEL_kafka_clients=groq/llama-3.3-70b-versatile
 """
 
 from .budget import BudgetExceeded, BudgetLedger, CallRecord, TicketBudget

@@ -18,9 +18,14 @@ from .registry import CATALOG, PRICING_AS_OF, TIERS, deepseek_is_peak
 from .router import default_router
 
 AGENTS = (
-    ("kora-global", "standard", "Cluster Linking — owns tickets, writes the 1-pager"),
-    ("consumer-team", "small", "Consumer groups — memory math, rebalance history"),
-    ("oss-kafka", "deep", "Kafka protocol — wire compatibility, KIP process"),
+    ("mirrormaker", "standard",
+     "MirrorMaker 2 — owns tickets, writes the 1-pager"),
+    ("group-coordinator", "small",
+     "Consumer groups — memory math, rebalance history"),
+    ("kafka-broker", "small",
+     "Broker routing — fan-out cost, heap budget, KRaft metadata"),
+    ("kafka-clients", "deep",
+     "Kafka wire protocol — compatibility, AdminClient, KIP process"),
 )
 
 
@@ -118,7 +123,7 @@ def show_estimate() -> None:
     print("  - ollama serve + `ollama pull qwen2.5:14b`   -> $0.00, fully local")
     print("  - export GROQ_API_KEY=...                    -> free tier, hosted")
     print("  - export SME_LLM_MAX_COST_PER_MTOK=0.30      -> hard cost ceiling")
-    print("  - export SME_LLM_TIER_oss_kafka=small        -> downgrade one agent")
+    print("  - export SME_LLM_TIER_kafka_clients=small   -> downgrade one agent")
     print()
 
 

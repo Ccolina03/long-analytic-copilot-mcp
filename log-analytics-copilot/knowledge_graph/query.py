@@ -40,10 +40,10 @@ def owning_team(codepath: str, conn: Any = None) -> str | None:
 
     Example::
 
-        >>> owning_team("confluent/kora-cluster-linking/src/")
-        'kora-global'
-        >>> owning_team("GroupCoordinator.scala")
-        'consumer-team'
+        >>> owning_team("connect/mirror/src/main/java/org/apache/kafka/connect/mirror/")
+        'mirrormaker'
+        >>> owning_team("GroupMetadataManager.java")
+        'group-coordinator'
         >>> owning_team("unknown/path.java")
         None
     """
@@ -111,8 +111,8 @@ def depends_on(service: str, depth: int = 1, conn: Any = None) -> list[str]:
 
     Example::
 
-        >>> depends_on("cluster-linking-service", depth=1)
-        ['group-coordinator-service', 'offset-translation-service']
+        >>> depends_on("mirrormaker-connect-worker", depth=1)
+        ['group-coordinator-service', 'offset-sync-store']
     """
     if depth < 1:
         raise ValueError("depth must be >= 1")
@@ -161,9 +161,9 @@ def must_approve(change_type: str, conn: Any = None) -> list[str]:
     Example::
 
         >>> must_approve("protocol_change")
-        ['oss-kafka']
+        ['kafka-clients']
         >>> must_approve("coordinator_memory_change")
-        ['broker-team']
+        ['kafka-broker']
     """
     if conn is None:
         from knowledge_graph.db import get_connection  # noqa: PLC0415

@@ -6,7 +6,7 @@ Tests
   test_owning_team_returns_correct_team_for_exact_path_match
   test_owning_team_returns_none_for_unknown_path
   test_owning_team_of_list_groups_returns_consumer_team   ← the specific check from §20.4
-  test_owning_team_of_clamp_offsets_returns_kora_global   ← the specific check from §20.4
+  test_owning_team_of_checkpoint_connector_returns_mirrormaker   ← the specific check from §20.4
   test_owning_team_prefers_more_specific_match
   test_depends_on_returns_direct_dependencies
   test_depends_on_respects_requested_depth
@@ -30,18 +30,18 @@ def _seeded_db():
     """
     Build a small but realistic test graph that mirrors the Part V example:
 
-      Teams:   kora-global, consumer-team, oss-kafka, broker-team
-      Paths:   OffsetClampingService.java → kora-global
-               confluent/kora-cluster-linking/ → kora-global
-               GroupCoordinator.scala → consumer-team
-               ListGroups → consumer-team
-               ListGroupsRequest.json → oss-kafka
+      Teams:   mirrormaker, group-coordinator, kafka-clients, kafka-broker
+      Paths:   MirrorCheckpointConnector.java → mirrormaker
+               connect/mirror/src/main/java/org/apache/kafka/connect/mirror/ → mirrormaker
+               GroupMetadataManager.java → group-coordinator
+               ListGroups → group-coordinator
+               ListGroupsRequest.json → kafka-clients
 
-      depends_on:  cluster-linking-service → group-coordinator-service
-                   cluster-linking-service → offset-translation-service
+      depends_on:  mirrormaker-connect-worker → group-coordinator-service
+                   mirrormaker-connect-worker → offset-sync-store
 
-      must_approve: protocol_change → oss-kafka
-                    coordinator_memory_change → broker-team
+      must_approve: protocol_change → kafka-clients
+                    coordinator_memory_change → kafka-broker
     """
     conn = sqlite3.connect(":memory:")
     conn.execute("PRAGMA foreign_keys = ON")
@@ -63,37 +63,37 @@ def _seeded_db():
         )
 
     # Teams
-    kora   = add_entity("kora-global",    "team")
-    ct     = add_entity("consumer-team",  "team")
-    oss    = add_entity("oss-kafka",       "team")
-    broker = add_entity("broker-team",    "team")
+    mm     = add_entity("mirrormaker",    "team")
+    ct     = add_entity("group-coordinator",  "team")
+    clients = add_entity("kafka-clients",     "team")
+    broker = add_entity("kafka-broker",    "team")
 
     # Codepaths
-    clamp     = add_entity("OffsetClampingService.java",         "codepath")
-    kora_dir  = add_entity("confluent/kora-cluster-linking/",   "codepath")
-    gc_scala  = add_entity("GroupCoordinator.scala",            "codepath")
+    discover  = add_entity("MirrorCheckpointConnector.java",         "codepath")
+    mirror_dir  = add_entity("connect/mirror/src/main/java/org/apache/kafka/connect/mirror/",   "codepath")
+    gc_scala  = add_entity("GroupMetadataManager.java",            "codepath")
     list_grps = add_entity("ListGroups",                        "codepath")
     lg_json   = add_entity("ListGroupsRequest.json",            "codepath")
 
     # Ownership edges
-    add_edge(kora, clamp,     "owns")
-    add_edge(kora, kora_dir,  "owns")
+    add_edge(mm, discover,  "owns")
+    add_edge(mm, mirror_dir, "owns")
     add_edge(ct,   gc_scala,  "owns")
     add_edge(ct,   list_grps, "owns")
-    add_edge(oss,  lg_json,   "owns")
+    add_edge(clients,  lg_json,   "owns")
 
     # Services for depends_on
-    cls_svc = add_entity("cluster-linking-service", "service")
+    mm_svc  = add_entity("mirrormaker-connect-worker", "service")
     gc_svc  = add_entity("group-coordinator-service", "service")
-    ot_svc  = add_entity("offset-translation-service", "service")
-    add_edge(cls_svc, gc_svc, "depends_on")
-    add_edge(cls_svc, ot_svc, "depends_on")
-    add_edge(gc_svc,  oss,    "depends_on", confidence=0.5)
+    ot_svc  = add_entity("offset-sync-store", "service")
+    add_edge(mm_svc, gc_svc, "depends_on")
+    add_edge(mm_svc, ot_svc, "depends_on")
+    add_edge(gc_svc,  clients,    "depends_on", confidence=0.5)
 
     # Approval rules
     proto_rule = add_entity("protocol_change",          "rule")
     mem_rule   = add_entity("coordinator_memory_change", "rule")
-    add_edge(proto_rule, oss,    "must_approve")
+    add_edge(proto_rule, clients,    "must_approve")
     add_edge(mem_rule,   broker, "must_approve")
 
     conn.commit()
@@ -110,29 +110,29 @@ class TestOwningTeam:
         self.conn = _seeded_db()
 
     def test_exact_path_returns_correct_team(self):
-        assert owning_team("OffsetClampingService.java", conn=self.conn) == "kora-global"
+        assert owning_team("MirrorCheckpointConnector.java", conn=self.conn) == "mirrormaker"
 
     def test_exact_path_for_consumer_team(self):
-        assert owning_team("GroupCoordinator.scala", conn=self.conn) == "consumer-team"
+        assert owning_team("GroupMetadataManager.java", conn=self.conn) == "group-coordinator"
 
     def test_owning_team_of_list_groups_returns_consumer_team(self):
         """Direct equivalent of the §20.4 integration check."""
-        assert owning_team("ListGroups", conn=self.conn) == "consumer-team"
+        assert owning_team("ListGroups", conn=self.conn) == "group-coordinator"
 
-    def test_owning_team_of_clamp_offsets_returns_kora_global(self):
+    def test_owning_team_of_checkpoint_connector_returns_mirrormaker(self):
         """Direct equivalent of the §20.4 integration check."""
-        assert owning_team("OffsetClampingService.java", conn=self.conn) == "kora-global"
+        assert owning_team("MirrorCheckpointConnector.java", conn=self.conn) == "mirrormaker"
 
     def test_returns_none_for_unknown_path(self):
         assert owning_team("some/completely/unknown/path.java", conn=self.conn) is None
 
-    def test_prefix_match_resolves_kora_directory(self):
-        # A sub-path of the kora dir should match kora-global
+    def test_prefix_match_resolves_mirror_directory(self):
+        # A sub-path of the connect/mirror dir should match mirrormaker
         result = owning_team(
-            "confluent/kora-cluster-linking/src/FailoverCoordinator.java",
+            "connect/mirror/src/main/java/org/apache/kafka/connect/mirror/src/MirrorCheckpointTask.java",
             conn=self.conn,
         )
-        assert result == "kora-global"
+        assert result == "mirrormaker"
 
     def test_prefers_more_specific_match(self):
         """When two patterns both match, the longer (more specific) one wins."""
@@ -167,19 +167,19 @@ class TestDependsOn:
         self.conn = _seeded_db()
 
     def test_returns_direct_dependencies(self):
-        deps = depends_on("cluster-linking-service", depth=1, conn=self.conn)
+        deps = depends_on("mirrormaker-connect-worker", depth=1, conn=self.conn)
         assert "group-coordinator-service" in deps
-        assert "offset-translation-service" in deps
+        assert "offset-sync-store" in deps
 
     def test_depth_one_does_not_include_transitive(self):
-        # gc-service depends on oss-kafka (added in fixture), but depth=1 from
-        # cluster-linking should NOT include oss-kafka
-        deps = depends_on("cluster-linking-service", depth=1, conn=self.conn)
-        assert "oss-kafka" not in deps
+        # gc-service depends on kafka-clients (added in fixture), but depth=1 from
+        # mirrormaker should NOT include kafka-clients
+        deps = depends_on("mirrormaker-connect-worker", depth=1, conn=self.conn)
+        assert "kafka-clients" not in deps
 
     def test_depth_two_includes_transitive(self):
-        deps = depends_on("cluster-linking-service", depth=2, conn=self.conn)
-        assert "oss-kafka" in deps
+        deps = depends_on("mirrormaker-connect-worker", depth=2, conn=self.conn)
+        assert "kafka-clients" in deps
 
     def test_depth_below_one_raises(self):
         with pytest.raises(ValueError, match="depth must be >= 1"):
@@ -191,8 +191,8 @@ class TestDependsOn:
 
     def test_respects_requested_depth(self):
         """depth=1 and depth=2 must return different result sizes."""
-        d1 = depends_on("cluster-linking-service", depth=1, conn=self.conn)
-        d2 = depends_on("cluster-linking-service", depth=2, conn=self.conn)
+        d1 = depends_on("mirrormaker-connect-worker", depth=1, conn=self.conn)
+        d2 = depends_on("mirrormaker-connect-worker", depth=2, conn=self.conn)
         assert len(d2) >= len(d1)
 
 
@@ -207,11 +207,11 @@ class TestMustApprove:
 
     def test_protocol_change_requires_oss_kafka(self):
         approvers = must_approve("protocol_change", conn=self.conn)
-        assert "oss-kafka" in approvers
+        assert "kafka-clients" in approvers
 
     def test_coordinator_memory_change_requires_broker_team(self):
         approvers = must_approve("coordinator_memory_change", conn=self.conn)
-        assert "broker-team" in approvers
+        assert "kafka-broker" in approvers
 
     def test_unknown_change_type_returns_empty(self):
         approvers = must_approve("totally_unknown_change", conn=self.conn)
