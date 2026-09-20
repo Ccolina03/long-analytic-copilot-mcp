@@ -1,8 +1,6 @@
 /**
- * Records a headless demo of the SME network UI to demo/sme-network-demo.webm
- *
- * Usage (from repo root, with `npm run dev` on :3000):
- *   cd web && npm run record-demo
+ * Records a cinematic demo to demo/sme-network-demo.webm
+ * Holds on splash, Jira, discovery rail, mesh hops, and finale.
  */
 import { chromium } from "playwright";
 import fs from "node:fs";
@@ -24,21 +22,24 @@ const context = await browser.newContext({
 });
 const page = await context.newPage();
 
-console.log(`Recording demo from ${base} …`);
+console.log(`Recording cinematic demo from ${base} …`);
 await page.goto(base, { waitUntil: "networkidle", timeout: 60000 });
 await page.waitForSelector(".splash-title", { timeout: 30000 });
-await page.waitForTimeout(1800);
+await page.waitForTimeout(2400);
 
 await page.getByRole("button", { name: "Watch recorded demo" }).click();
 
 await page.waitForSelector(".jira-card", { timeout: 30000 });
-await page.waitForTimeout(1200);
+await page.waitForTimeout(2800);
 
-await page.waitForSelector(".spotlight-card", { timeout: 90000 });
-await page.waitForTimeout(1600);
+// Mesh should be visible under discovery rail; wait for first hop signal too.
+await page.waitForSelector(".spot-rail", { timeout: 120000 });
+await page.waitForTimeout(2000);
+await page.waitForSelector(".signal", { timeout: 120000 }).catch(() => null);
+await page.waitForTimeout(3500);
 
-await page.waitForSelector(".finale-panel", { timeout: 180000 });
-await page.waitForTimeout(4000);
+await page.waitForSelector(".finale-panel", { timeout: 240000 });
+await page.waitForTimeout(5000);
 
 await context.close();
 await browser.close();

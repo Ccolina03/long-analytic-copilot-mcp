@@ -26,11 +26,11 @@ type Props = {
 
 /** Fixed seats — agents never move. Pentagon around a status core. */
 const SEATS: Record<string, Pt> = {
-  mirrormaker: { x: 50, y: 14 },
-  "group-coordinator": { x: 84, y: 38 },
-  "kafka-broker": { x: 72, y: 78 },
-  "kafka-clients": { x: 28, y: 78 },
-  "kafka-security": { x: 16, y: 38 },
+  mirrormaker: { x: 50, y: 13 },
+  "group-coordinator": { x: 86, y: 36 },
+  "kafka-broker": { x: 74, y: 70 },
+  "kafka-clients": { x: 26, y: 70 },
+  "kafka-security": { x: 14, y: 36 },
 };
 
 function seat(id: string): Pt {
@@ -217,7 +217,6 @@ export default function Floor({
             }}
             onClick={() => onSelect(lane.id)}
           >
-            <div className="pod-scan" aria-hidden />
             <header className="pod-head">
               <div className="pod-mark">
                 {liveNode ? <span className="pod-ring" /> : null}

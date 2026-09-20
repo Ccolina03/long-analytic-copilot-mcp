@@ -28,7 +28,7 @@ export default function JiraTicket({
             <span className="jira-logo" aria-hidden>
               J
             </span>
-            <span>Jira · issue intake</span>
+            <span>New issue · routed to SME mesh</span>
           </div>
           <a
             className="jira-key"
@@ -46,12 +46,11 @@ export default function JiraTicket({
         <div className="jira-meta">
           <span className="jira-pill priority">{priority}</span>
           <span className="jira-pill">Owner · {team}</span>
-          <span className="jira-pill">Type · Improvement</span>
         </div>
         <p className="jira-desc">{description}</p>
         <footer className="jira-foot">
           <span className="jira-pulse" />
-          Routing into the SME mesh
+          Handing off to MirrorMaker
         </footer>
       </div>
     </div>

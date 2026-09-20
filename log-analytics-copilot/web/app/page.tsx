@@ -46,22 +46,24 @@ async function waitForRun(id: string): Promise<TicketSnapshot> {
   throw new Error("timed out waiting for the agent run");
 }
 
-function delayFor(kind: string, fast: boolean): number {
-  const scale = fast ? 0.45 : 1;
-  let base = 220;
-  if (kind === "request" || kind === "response") base = 4200;
-  else if (kind === "peer_decision") base = 2200;
-  else if (kind === "finding" || kind === "alternative" || kind === "concern") base = 1200;
-  else if (kind === "tool_call") base = 800;
-  else if (kind === "ticket") base = 2400;
-  return Math.max(120, Math.round(base * scale));
+function delayFor(kind: string, cinematic: boolean): number {
+  // Cinematic = slower so transitions read on camera. Default = normal demo pace.
+  const scale = cinematic ? 1.35 : 1;
+  let base = 280;
+  if (kind === "request" || kind === "response") base = 5200;
+  else if (kind === "peer_decision") base = 2600;
+  else if (kind === "finding" || kind === "alternative" || kind === "concern") base = 1400;
+  else if (kind === "tool_call") base = 900;
+  else if (kind === "ticket") base = 3200;
+  else if (kind === "signal") base = 900;
+  return Math.max(160, Math.round(base * scale));
 }
 
 function replay(
   trace: Trace,
   onEvent: (e: TraceEvent) => void,
   onDone: () => void,
-  fast: boolean,
+  cinematic: boolean,
 ) {
   let i = 0;
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -73,7 +75,7 @@ function replay(
     const e = trace.events[i];
     onEvent(e);
     i += 1;
-    timer = setTimeout(tick, trace.events[i] ? delayFor(e.kind, fast) : 80);
+    timer = setTimeout(tick, trace.events[i] ? delayFor(e.kind, cinematic) : 80);
   };
   tick();
   return () => {
@@ -172,7 +174,7 @@ export default function Page() {
     if (e.kind === "ticket") {
       setShowJira(true);
       if (jiraTimer.current) clearTimeout(jiraTimer.current);
-      jiraTimer.current = setTimeout(() => setShowJira(false), 2800);
+      jiraTimer.current = setTimeout(() => setShowJira(false), 3400);
     }
     if (e.kind === "peer_decision") {
       setSpotlightHold(true);
@@ -241,7 +243,7 @@ export default function Page() {
     }
   };
 
-  const runRecorded = async (fast = false) => {
+  const runRecorded = async (cinematic = true) => {
     reset();
     setStatus("running");
     setSource("recorded");
@@ -274,7 +276,7 @@ export default function Page() {
         setStatus("done");
         setShowFinale(true);
       },
-      fast,
+      cinematic,
     );
   };
 
@@ -290,7 +292,7 @@ export default function Page() {
   if (status === "idle") {
     return (
       <div className="shell splash-shell">
-        <Splash onStart={runLive} onReplay={() => runRecorded(false)} />
+        <Splash onStart={runLive} onReplay={() => runRecorded(true)} />
       </div>
     );
   }
@@ -327,7 +329,7 @@ export default function Page() {
           </button>
           <button
             className="btn ghost"
-            onClick={() => runRecorded(false)}
+            onClick={() => runRecorded(true)}
             disabled={status === "running"}
           >
             Replay
@@ -374,7 +376,7 @@ export default function Page() {
           events={events}
           title={title}
           onClose={() => setShowFinale(false)}
-          onReplay={() => runRecorded(false)}
+          onReplay={() => runRecorded(true)}
         />
 
         {left && (
