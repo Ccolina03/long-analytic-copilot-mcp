@@ -30,18 +30,36 @@ Open http://localhost:3000 → **Watch recorded demo** (or **Run live**).
 
 ## Tech stack
 
-| Layer | What |
-|-------|------|
-| **API gateway** | FastAPI — ticket intake, Jira webhook normalize, health/directory, SSE/trace snapshots |
-| **Ticket router** | Dumb team → owning SME handoff (no LLM classifier in the middle) |
-| **Agent mesh** | Peer-to-peer SME agents; typed `ImpactRequest` / `ImpactResponse` (`proto/`) |
-| **Transport** | In-process `DirectTransport` today; same shapes as a gRPC peer channel |
-| **Discovery** | Impact signals → consult / skip (`agents/discovery.py` + directory) |
-| **Ownership** | Runbooks + CODEOWNERS; knowledge graph ingest/query (Postgres-ready) |
-| **LLM** | Cheapest-model router + per-ticket budget (`llm/`) |
-| **UI** | Next.js 15 + TypeScript — mesh floor, cinematic demo replay |
-| **Integrations** | Jira issue webhooks; recorded + live demo paths |
-| **Tests** | pytest (~558) — agents, API, router, knowledge graph, e2e |
+**Languages**
+- **Python** — agents, API gateway, discovery, knowledge graph, LLM router, tests  
+- **TypeScript / React** — Next.js mesh UI  
+- **SQL** — knowledge-graph schema (`knowledge_graph/schema.sql`)  
+- **Markdown** — per-team runbooks + CODEOWNERS  
+
+**Backend & agents**
+- **FastAPI** + **Uvicorn** — API gateway (tickets, Jira webhooks, health, directory, traces)  
+- **pytest** — ~558 unit / API / e2e tests  
+- Peer **SME agents** — no central orchestrator; owning agent drives the run  
+
+**Protocols & messaging**
+- Typed **`ImpactRequest` / `ImpactResponse`** protocol (`proto/`) — gRPC-shaped peer consults  
+- **`DirectTransport`** in-process today (same call shapes as a gRPC channel)  
+- **SSE / JSON** snapshots from the gateway to the UI  
+
+**Graphs & ownership**
+- **Knowledge graph** — team / repo / code-path ownership edges (Postgres-ready)  
+- **CODEOWNERS** ingest + query (`knowledge_graph/`)  
+- **Discovery directory** — impact signals → consult or skip with a recorded reason  
+
+**Frontend**
+- **Next.js 15** (App Router) + **React 19** + **CSS** — live mesh floor + cinematic demo replay  
+
+**Integrations**
+- **Jira** issue webhooks → normalized ticket → owning SME  
+- Optional **LLM** providers via cheapest-model router + per-ticket budget (`llm/`)  
+
+**Domain**
+- Apache **Kafka** SME teams (MirrorMaker, Group Coordinator, Broker, Clients, Security, …)  
 
 ## Highlights (resume-ready)
 
