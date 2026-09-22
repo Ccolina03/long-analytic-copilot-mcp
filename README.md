@@ -32,6 +32,28 @@ Open http://localhost:3000 → **Watch recorded demo** (or **Run live**).
 
 Jira webhook: `POST /api/webhooks/jira` (details in [`log-analytics-copilot/README.md`](log-analytics-copilot/README.md)).
 
+## Tech stack
+
+| Layer | What |
+|-------|------|
+| **API gateway** | FastAPI — ticket intake, Jira webhook normalize, health/directory, SSE/trace snapshots |
+| **Ticket router** | Dumb team → owning SME handoff (no LLM classifier in the middle) |
+| **Agent mesh** | Peer-to-peer SME agents; typed `ImpactRequest` / `ImpactResponse` protocol (`proto/`) |
+| **Transport** | In-process `DirectTransport` today; same shapes as a gRPC peer channel |
+| **Discovery** | Impact signals → consult / skip via `agents/discovery.py` + team directory |
+| **Ownership** | Runbooks + CODEOWNERS; knowledge graph ingest/query (Postgres-ready) |
+| **LLM** | Cheapest-model router + per-ticket budget (`llm/`) |
+| **UI** | Next.js 15 App Router, TypeScript — mesh floor, cinematic demo replay |
+| **Integrations** | Jira issue webhooks; recorded demo + live run paths |
+| **Tests** | pytest (~558) across agents, API, router, knowledge graph, e2e |
+
+## Highlights (resume-ready)
+
+- Built a **peer-to-peer SME agent mesh** (no central orchestrator) where the owning agent drives investigation, discovery, multi-round deliberation, and a design **1-pager**
+- Implemented **impact-signal discovery** that consults only blast-radius owners and **skips ~50% of peers** with recorded reasons (demo: 4 consult / 4 skip) instead of a hardcoded peer list
+- Shipped a **FastAPI API gateway** that normalizes **Jira webhooks** into tickets, routes by owning team, and exposes run traces for a **Next.js** mesh UI
+- Modeled cross-team asks as a typed **gRPC-shaped protocol** (`ImpactRequest`/`ImpactResponse`) over `DirectTransport`, with runbooks + CODEOWNERS as ownership source of truth
+
 ## Project layout
 
 Code lives under [`log-analytics-copilot/`](log-analytics-copilot/).
