@@ -28,6 +28,39 @@ Open http://localhost:3000 → **Watch recorded demo** (or **Run live**).
 3. **Deliberation** — peers answer across the mesh  
 4. **1-pager** — decision brief with consulted / skipped  
 
+## API gateway
+
+Single external entry point — **FastAPI** on `:8080` (`api/main.py`).  
+It does **not** run agent logic; it accepts tickets, routes to the owning SME, and streams/traces the run back to the UI.
+
+```
+Jira / UI / curl
+      │  HTTPS + JSON
+      ▼
+┌─────────────────────────────┐
+│  API gateway (FastAPI)      │
+│  · normalize ticket shape   │
+│  · route by owning team     │
+│  · start agent run          │
+│  · expose events + 1-pager  │
+└─────────────┬───────────────┘
+              │  team → owning SME
+              ▼
+        SME agent mesh
+```
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `POST` | `/api/tickets` | Start a ticket (returns id immediately) |
+| `POST` | `/api/demo` | Start the canned MirrorMaker demo |
+| `POST` | `/api/webhooks/jira` | Jira issue created → ticket run |
+| `GET` | `/api/tickets/{id}` | Snapshot: events, finding, 1-pager |
+| `GET` | `/api/tickets/{id}/stream` | SSE of events as they happen |
+| `GET` | `/api/directory` | Discovery directory (teams / owns / answers) |
+| `GET` | `/api/health` | Liveness + implemented agents |
+
+Next.js rewrites `/api/*` → this gateway (`web/next.config.ts`, `API_URL`).
+
 ## Tech stack
 
 **Languages**
